@@ -86,7 +86,6 @@ It flags e-mail addresses, IP and MAC addresses, home directories, GUIDs and tok
 
 - **CI** (`.github/workflows/ci.yml`) runs on every push and PR: lint, the privacy scan, the full suite on Python 3.11 and 3.12, then builds the exe, smoke-tests it (starts, shows a window, single-instance, no tracebacks), builds the installer and runs it end to end (silent install, launch, uninstall).
 - **Canary** (`canary.yml`) runs weekly against the *latest* dependency versions and opens an issue if pybose or anything else broke.
-- **Dependabot** proposes dependency and action updates; CI decides whether they're safe.
 - **Release** (`release.yml`) follows a green CI run on `main` and publishes automatically; see below.
 
 ### Releases are automatic

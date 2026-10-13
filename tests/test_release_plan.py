@@ -76,7 +76,7 @@ def test_app_change_after_a_release_publishes_again(repo):
     assert out["publish"] == "true" and out["version"] == "1.4.60" and out["prev"] == "v1.4.5"
 
 
-@pytest.mark.parametrize("path", ["README.md", "tests/test_x.py", "LICENSE", ".github/dependabot.yml",
+@pytest.mark.parametrize("path", ["README.md", "tests/test_x.py", "LICENSE", ".github/PULL_REQUEST_TEMPLATE.md",
                                   ".github/workflows/ci.yml", "pyproject.toml", "scripts/check_privacy.py"])
 def test_docs_tests_and_plumbing_do_not_trigger_a_release(repo, path):
     repo.git("tag", "v1.4.5")

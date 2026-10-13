@@ -182,12 +182,6 @@ def test_app_reports_the_stamped_version():
     assert build_info.VERSION == "", "the committed build_info must not carry a stamped version"
 
 
-def test_dependabot_covers_pip_and_actions():
-    cfg = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
-    ecosystems = {u["package-ecosystem"] for u in cfg["updates"]}
-    assert {"pip", "github-actions"} <= ecosystems
-
-
 def test_this_runs_on_the_python_the_ci_uses():
     assert sys.version_info >= (3, 11)
 
