@@ -163,7 +163,11 @@ jobs:
           Integrity: `SHA256SUMS.txt` lists the checksums, and every file carries a signed build attestation
           (`gh attestation verify <file> --repo __REPO__`).
 
-          Built on [pybose](https://github.com/cavefire/pybose) by cavefire.
+          ## About
+
+          **Bose Soundbar Remote** is an unofficial Windows remote for Bose speakers. Source code, issues and updates: https://github.com/__REPO__
+
+          Speaker control is provided by [pybose](https://github.com/cavefire/pybose), an open-source library by cavefire (GPL-3.0). Thank you!
 
           ## What's changed
 
@@ -188,7 +192,7 @@ jobs:
         with:
           tag_name: v${{ needs.plan.outputs.version }}
           target_commitish: ${{ needs.plan.outputs.sha }}
-          name: v${{ needs.plan.outputs.version }}
+          name: Bose Soundbar Remote v${{ needs.plan.outputs.version }}
           body_path: release-notes.md
           files: release/*
           make_latest: true

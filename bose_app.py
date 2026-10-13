@@ -32,6 +32,8 @@ APP_NAME = "Bose Soundbar"
 APP_VERSION = "1.4.0"  # the version series; the release workflow stamps the full version (1.4.<build>) via build_info
 if BUILD_VERSION:
     APP_VERSION = BUILD_VERSION
+PROJECT_URL = f"https://github.com/{REPO or 'amidstdebug/bose-device-control'}"  # this project
+PYBOSE_URL = "https://github.com/cavefire/pybose"  # the library that talks to the speaker
 AUMID = "BoseSoundbarRemote.App"  # gives the taskbar its own identity/icon instead of Python's
 SINGLE_INSTANCE_PORT = int(os.environ.get("BOSE_REMOTE_PORT") or 47653)
 POLL_SECONDS = 5  # safety-net refresh interval (tests shorten it)
@@ -851,11 +853,18 @@ class App(ctk.CTk):
         card = self._section("About")
         ctk.CTkLabel(card, text=f"{APP_NAME} Remote  ·  v{APP_VERSION}", anchor="w", font=self.F(13, True)
                      ).pack(fill="x", padx=18, pady=(14, 0))
-        ctk.CTkLabel(card, text="Unofficial; not affiliated with Bose. Talks to your speaker through pybose "
-                     "by cavefire (GPL-3.0).", text_color=MUTED, anchor="w", justify="left", wraplength=380,
-                     font=self.F(11)).pack(fill="x", padx=18)
-        self._btn(card, "pybose on GitHub",
-                  lambda: webbrowser.open("https://github.com/cavefire/pybose")).pack(fill="x", padx=18, pady=(10, 0))
+        ctk.CTkLabel(card, text="An unofficial remote for Bose speakers. Not affiliated with Bose.",
+                     text_color=MUTED, anchor="w", justify="left", wraplength=380, font=self.F(11)
+                     ).pack(fill="x", padx=18)
+        self._btn(card, PROJECT_URL.replace("https://", ""), lambda: webbrowser.open(PROJECT_URL)
+                  ).pack(fill="x", padx=18, pady=(10, 0))
+        ctk.CTkLabel(card, text="CREDITS", text_color=MUTED, anchor="w", font=self.F(11, True)
+                     ).pack(fill="x", padx=18, pady=(16, 0))
+        ctk.CTkLabel(card, text="Speaker control is done by pybose, an open-source library by cavefire (GPL-3.0).",
+                     text_color=MUTED, anchor="w", justify="left", wraplength=380, font=self.F(11)
+                     ).pack(fill="x", padx=18)
+        self._btn(card, "pybose by cavefire", lambda: webbrowser.open(PYBOSE_URL)
+                  ).pack(fill="x", padx=18, pady=(10, 0))
         self._end_card(card)
 
     def _build_error_box(self):

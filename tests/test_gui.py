@@ -626,7 +626,7 @@ def test_settings_page_has_every_control(make_app):
                    "Desktop shortcut", "Start menu entry", "Run when I sign in to Windows", "Pin to taskbar",
                    "Maximum volume", "Keyboard volume step", "Speaker IP address", "Show error messages",
                    "Check for updates at startup", "Open data folder", "Reset settings", "Re-scan network",
-                   "Reconnect", "Log out", "pybose on GitHub", "cavefire"):
+                   "Reconnect", "Log out", "pybose by cavefire", "Speaker control is done by pybose"):
         assert needle in shown, f"settings page lost {needle!r}"
 
 
@@ -923,3 +923,27 @@ def test_failed_update_download_is_reported_and_app_keeps_running(make_app, monk
     app._install_update()
     assert pump(app, lambda: "Update failed" in app.status.cget("text"))
     assert alive(app)
+
+
+def test_about_shows_this_project_first_then_credits_pybose(make_app, monkeypatch):
+    opened = []
+    monkeypatch.setattr(b.webbrowser, "open", lambda url: opened.append(url))
+    app = make_app()
+    shown = texts(app.settings)
+    project = b.PROJECT_URL.replace("https://", "")
+    assert project in shown and "pybose by cavefire" in shown and "CREDITS" in shown
+    assert shown.index(project) < shown.index("CREDITS") < shown.index("pybose by cavefire")
+    assert "pybose" not in project, "the project link must not read like the app is called pybose"
+
+    def find_button(widget, label):
+        for child in widget.winfo_children():
+            if isinstance(child, ctk.CTkButton) and child.cget("text") == label:
+                return child
+            if isinstance(child, ctk.CTkBaseClass):
+                hit = find_button(child, label)
+                if hit:
+                    return hit
+        return None
+    find_button(app.settings, project).invoke()
+    find_button(app.settings, "pybose by cavefire").invoke()
+    assert opened == [b.PROJECT_URL, b.PYBOSE_URL]

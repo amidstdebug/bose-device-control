@@ -197,3 +197,12 @@ def test_installer_ci_steps_do_not_hang_or_race():
         text = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
         assert "Start-Process $setup -Wait" not in text, f"{name}: -Wait would wait for the relaunched app forever"
         assert "WaitForExit" in text and "Test-Path $exe" in text, f"{name}: must wait for the uninstall to finish"
+
+
+def test_release_notes_introduce_the_app_before_crediting_pybose():
+    text = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    about = text.index("## About")
+    assert text.index("https://github.com/__REPO__", about) < text.index("pybose", about), \
+        "the project link comes first, then the pybose credit"
+    assert "Built on [pybose]" not in text, "wording made the app sound like it was called pybose"
+    assert "name: Bose Soundbar Remote v" in text, "the release is titled with the app's name"
