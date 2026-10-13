@@ -198,7 +198,7 @@ jobs:
         with:
           tag_name: v${{ needs.plan.outputs.version }}
           target_commitish: ${{ needs.plan.outputs.sha }}
-          name: Bose Soundbar Remote v${{ needs.plan.outputs.version }}
+          name: v${{ needs.plan.outputs.version }}
           body_path: release-notes.md
           files: release/*
           make_latest: true

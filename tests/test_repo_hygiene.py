@@ -206,4 +206,5 @@ def test_release_notes_introduce_the_app_before_crediting_pybose():
     assert text.index("https://github.com/__REPO__", about) < text.index("pybose", about), \
         "the project link comes first, then the pybose credit"
     assert "Built on [pybose]" not in text, "wording made the app sound like it was called pybose"
-    assert "name: Bose Soundbar Remote v" in text, "the release is titled with the app's name"
+    assert "name: v${{ needs.plan.outputs.version }}" in text, "the release is titled with just the version, like its tag"
+    assert "name: Bose Soundbar Remote v" not in text
