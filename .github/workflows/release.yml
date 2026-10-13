@@ -47,7 +47,12 @@ jobs:
         run: |
           $sha = (git rev-parse HEAD).Trim()
           $m = (Select-String -Path bose_app.py -Pattern '^APP_VERSION = "(\d+)\.(\d+)\.\d+"').Matches[0]
-          $ver = "{0}.{1}.{2}" -f $m.Groups[1].Value, $m.Groups[2].Value, $env:GITHUB_RUN_NUMBER
+          $series = "{0}.{1}" -f $m.Groups[1].Value, $m.Groups[2].Value
+          # next number after the highest release already published in this series, so runs that decide not to
+          # release never use one up (1.4.2 -> 1.4.3, never 1.4.2 -> 1.4.8)
+          $used = @(git tag -l "v$series.*" | ForEach-Object { if ($_ -match '^v\d+\.\d+\.(\d+)$') { [int]$Matches[1] } })
+          $next = if ($used.Count) { ($used | Measure-Object -Maximum).Maximum + 1 } else { 0 }
+          $ver = "$series.$next"
           $prev = (git describe --tags --abbrev=0 --match 'v*' 2>$null)
           if ($LASTEXITCODE -ne 0) { $prev = '' }
           $publish = $true
@@ -60,7 +65,8 @@ jobs:
             $why = if ($publish) { "$($worthy.Count) app file(s) changed since $prev" } else { "only docs/tests/plumbing changed since $prev" }
           }
           if ('${{ inputs.force }}' -eq 'true') { $publish = $true; $why = 'forced' }
-          if (git tag -l "v$ver") { $publish = $false; $why = "tag v$ver already exists" }
+          $already = @(git tag --points-at HEAD --list 'v*')
+          if ($already.Count) { $publish = $false; $why = "this commit is already released as $($already -join ', ')" }
           Write-Host "version=$ver publish=$publish ($why)"
           "version=$ver" >> $env:GITHUB_OUTPUT
           "publish=$($publish.ToString().ToLower())" >> $env:GITHUB_OUTPUT

@@ -62,9 +62,9 @@ def repo(tmp_path):
     return Repo(tmp_path)
 
 
-def test_first_ever_push_is_released_with_series_and_build_number(repo):
+def test_first_ever_release_of_a_series_is_number_zero(repo):
     out = repo.plan(run_number=57)
-    assert out["publish"] == "true" and out["version"] == "1.4.57" and out["prev"] == ""
+    assert out["publish"] == "true" and out["version"] == "1.4.0" and out["prev"] == ""
     assert len(out["sha"]) == 40
 
 
@@ -73,7 +73,7 @@ def test_app_change_after_a_release_publishes_again(repo):
     repo.write("bose_app.py", 'APP_VERSION = "1.4.0"\n# a change\n')
     repo.commit("fix something")
     out = repo.plan(run_number=60)
-    assert out["publish"] == "true" and out["version"] == "1.4.60" and out["prev"] == "v1.4.5"
+    assert out["publish"] == "true" and out["version"] == "1.4.6" and out["prev"] == "v1.4.5"
 
 
 @pytest.mark.parametrize("path", ["README.md", "tests/test_x.py", "LICENSE", ".github/PULL_REQUEST_TEMPLATE.md",
@@ -106,15 +106,45 @@ def test_bumping_the_series_changes_the_version_prefix(repo):
     repo.git("tag", "v1.4.5")
     repo.write("bose_app.py", 'APP_VERSION = "1.5.0"\n')
     repo.commit("Start version series 1.5.0")
-    assert repo.plan(run_number=61)["version"] == "1.5.61"
+    assert repo.plan(run_number=61)["version"] == "1.5.0", "a new series starts again at .0"
 
 
-def test_an_existing_tag_is_never_overwritten(repo):
-    repo.git("tag", "v1.4.57")
+def test_a_commit_that_is_already_released_is_not_released_again(repo):
     repo.write("updater.py", "code\n")
     repo.commit("change")
-    out = repo.plan(run_number=57)
-    assert out["publish"] == "false", "re-running an already published build must not clobber the release"
+    repo.git("tag", "v1.4.7")  # this very commit
+    out = repo.plan()
+    assert out["publish"] == "false", "re-running the workflow must not publish a duplicate"
+
+
+def test_skipped_runs_never_use_up_version_numbers(repo):
+    repo.git("tag", "v1.4.2")
+    seen = set()
+    for run in (10, 11, 12, 13):  # four workflow runs, none of which released anything
+        repo.write("README.md", f"docs {run}\n")
+        repo.commit(f"docs {run}")
+        out = repo.plan(run_number=run)
+        assert out["publish"] == "false"
+        seen.add(out["version"])
+    repo.write("updater.py", "real change\n")
+    repo.commit("real change")
+    out = repo.plan(run_number=14)
+    assert out["publish"] == "true" and out["version"] == "1.4.3", "the next release is simply 1.4.3"
+
+
+def test_version_does_not_depend_on_the_run_number(repo):
+    repo.git("tag", "v1.4.2")
+    repo.write("updater.py", "code\n")
+    repo.commit("change")
+    assert repo.plan(run_number=5)["version"] == repo.plan(run_number=999)["version"] == "1.4.3"
+
+
+def test_the_highest_number_wins_even_if_tags_are_out_of_order(repo):
+    for tag in ("v1.4.9", "v1.4.2", "v1.4.10"):
+        repo.git("tag", tag)
+    repo.write("updater.py", "code\n")
+    repo.commit("change")
+    assert repo.plan()["version"] == "1.4.11", "numeric, not alphabetical, ordering"
 
 
 def test_force_publishes_even_docs_only_changes(repo):

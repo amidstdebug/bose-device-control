@@ -156,7 +156,8 @@ def test_release_is_automatic_after_green_ci_and_can_be_skipped():
     assert "conclusion == 'success'" in text, "must only release after CI passed"
     assert "[skip release]" in text
     assert "workflow_run.head_sha" in text, "must build the exact commit CI tested"
-    assert "GITHUB_RUN_NUMBER" in text and "APP_VERSION" in text, "version = series + build number"
+    assert "APP_VERSION" in text and "git tag -l" in text, "version = series + next release number from the tags"
+    assert "GITHUB_RUN_NUMBER" not in text, "skipped runs must not consume version numbers"
 
 
 def test_ci_runs_on_push_and_is_not_double_triggered():

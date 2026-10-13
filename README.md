@@ -92,10 +92,10 @@ It flags e-mail addresses, IP and MAC addresses, home directories, GUIDs and tok
 
 Push to `main`. When CI goes green **and the commit changes the app** (`bose_app.py`, `updater.py`, assets, installer, requirements, build scripts), the **Release** workflow builds exactly that commit, tests the installer end to end (silent install, launch, uninstall), writes `SHA256SUMS.txt`, attaches a build-provenance attestation and publishes a GitHub Release with the installer, the portable zip and a changelog built from the commit messages. The app then offers that update to everyone who has it installed.
 
-- **Version numbers** are `<series>.<build>`, for example `1.4.57`. The series (`1.4`) is `APP_VERSION` in `bose_app.py`; the build number is stamped by CI, so no version-bump commits are needed.
+- **Version numbers** are `<series>.<n>`, for example `1.4.3`. The series (`1.4`) is `APP_VERSION` in `bose_app.py`; `n` is simply the next number after the last release in that series, stamped by CI. Pushes that don't release never use a number up, and no version-bump commits are needed.
 - **Docs-only, test-only and CI-plumbing changes** don't create a release.
 - Put **`[skip release]`** in a commit message to skip one explicitly.
-- A new minor/major number: `.\scripts\release.ps1 -Version 1.5.0 -Push` (sets the series; the pipeline releases it as `1.5.<build>`).
+- A new minor/major number: `.\scripts\release.ps1 -Version 1.5.0 -Push` (sets the series; the pipeline releases it as `1.5.0`, then `1.5.1`, ...).
 - Re-run or force one by hand from the Actions tab: *Release → Run workflow*.
 
 ## License
