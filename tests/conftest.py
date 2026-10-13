@@ -7,6 +7,9 @@ import time
 from pathlib import Path
 
 import pytest
+from PIL import Image as _PILImage
+
+_PILImage.init()  # see the note in bose_app.py: avoids a lazy-import deadlock between threads
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))

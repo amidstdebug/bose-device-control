@@ -1,9 +1,11 @@
 """Logic that needs no window: helpers, config, source list building, shortcuts, networking helpers, images."""
 import io
 import json
+import os
 import socket
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -241,3 +243,22 @@ def test_config_file_never_contains_a_password_field(data_dir):
 def test_png_helper_is_valid():
     assert png_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     assert io.BytesIO(png_bytes()).readable()
+
+
+def test_pillow_plugins_are_loaded_at_start_up_not_lazily_on_a_worker_thread():
+    """A fresh interpreter that only imports the app must already have the PNG and JPEG plugins registered."""
+    import subprocess
+    code = ("import bose_app; from PIL import Image; "
+            "assert 'PNG' in Image.SAVE and 'JPEG' in Image.OPEN and 'PNG' in Image.OPEN, sorted(Image.OPEN)")
+    env = {**os.environ, "BOSE_REMOTE_TEST_HIDDEN": "1"}
+    r = subprocess.run([sys.executable, "-c", code], cwd=Path(b.__file__).parent, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-800:]
+
+
+def test_decoding_covers_from_many_threads_at_once_does_not_hang():
+    import concurrent.futures as cf
+    data = png_bytes(size=(400, 400))
+    with cf.ThreadPoolExecutor(16) as ex:
+        results = list(ex.map(lambda _: b.art_pil_from_bytes(data).size, range(48), timeout=60))
+    assert set(results) == {(170, 170)}

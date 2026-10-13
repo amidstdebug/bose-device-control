@@ -27,6 +27,12 @@ from pybose.BoseSpeaker import BoseSpeaker
 import updater
 from build_info import REPO
 from build_info import VERSION as BUILD_VERSION
+from PIL import Image as _PILImage
+
+# Pillow imports its PNG/JPEG/... plugins lazily on first use. Covers are decoded on worker threads while the UI
+# thread also uses Pillow, and two threads doing that first import at once can deadlock on Python's import lock
+# (seen in CI as a hang). Loading them here, once, on the main thread, removes the race.
+_PILImage.init()
 
 APP_NAME = "Bose Soundbar"
 APP_VERSION = "1.4.0"  # the version series; the release workflow stamps the full version (1.4.<build>) via build_info
