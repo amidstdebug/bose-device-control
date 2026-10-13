@@ -173,7 +173,7 @@ jobs:
           Set-Content release-notes.md $notes -Encoding utf8
 
       - name: Attest build provenance (lets anyone verify these files came from this repo's workflow)
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: release/*
 
