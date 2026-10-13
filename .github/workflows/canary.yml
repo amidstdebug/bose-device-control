@@ -1,0 +1,35 @@
+name: Canary (latest dependencies)
+
+# pybose is unofficial and reverse-engineered, and Bose can change things at any time. Once a week, test against the
+# NEWEST versions of every dependency, so breakage is spotted before users hit it.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the latest of everything (ignoring the pins)
+        run: pip install pybose customtkinter requests pyjwt cryptography pystray pillow zeroconf websockets pytest PyYAML
+      - name: Show what we got
+        run: pip list
+      - name: Run the tests
+        run: pytest tests -v
+      - name: Open an issue if upstream broke something
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $body = "The weekly canary run failed against the latest dependency versions.`n`nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`n`nMost likely a pybose (or other dependency) update changed something. Check the contract tests first."
+          gh issue create --repo ${{ github.repository }} --title "Canary failed: upstream dependency change" --body $body --label bug

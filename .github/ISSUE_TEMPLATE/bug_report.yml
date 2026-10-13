@@ -1,0 +1,38 @@
+name: Bug report
+description: Something doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: errors
+    attributes:
+      label: Error messages
+      description: Turn on **Settings → Advanced → Show error messages**, reproduce the problem, press **Copy**, and paste here.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Settings → About
+    validations:
+      required: true
+  - type: input
+    id: speaker
+    attributes:
+      label: Speaker model
+      placeholder: Soundbar 700
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options: [Installer, Portable zip, Running from source]
+  - type: markdown
+    attributes:
+      value: |
+        Please **don't** paste your password, tokens, or `bose_config.json`. The log file (`%APPDATA%\BoseSoundbarRemote\bose_app.log`) is safe to attach.

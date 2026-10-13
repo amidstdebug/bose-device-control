@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.17.0
+      - run: ruff check .
+      - name: Privacy check (no personal data, IPs, e-mails, tokens or home paths in the repo)
+        run: python scripts/check_privacy.py --all
+
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Run the test suite
+        timeout-minutes: 25
+        run: pytest tests -v --durations=15 --cov --cov-report=xml --cov-report=term --junitxml=test-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-py${{ matrix.python }}
+          path: |
+            test-results.xml
+            coverage.xml
+
+  build:
+    name: Build, smoke-test and installer-test
+    needs: [lint, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+
+      - name: Build the exe
+        run: python scripts/build_exe.py
+
+      - name: Smoke-test the exe (starts, shows a window, single instance, no tracebacks)
+        run: python scripts/smoke_test_exe.py dist/BoseSoundbarRemote/BoseSoundbarRemote.exe
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $ver = (Select-String -Path bose_app.py -Pattern '^APP_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$ver" installer\BoseSoundbarRemote.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem dist-installer
+
+      - name: Install silently, run the installed app, then uninstall
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist-installer -Filter 'BoseSoundbarRemote-Setup-*.exe').FullName
+          $dir = Join-Path $env:RUNNER_TEMP 'bose-installed'
+          # Wait for the installer process only: -Wait would also wait for the app it relaunches, forever.
+          $p = Start-Process $setup -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/DIR=$dir"
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
+          Get-Process BoseSoundbarRemote -ErrorAction SilentlyContinue | Stop-Process -Force
+          $exe = Join-Path $dir 'BoseSoundbarRemote.exe'
+          if (-not (Test-Path $exe)) { throw "installer did not install the exe" }
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          if (-not (Test-Path "$desktop\Bose Soundbar.lnk")) { throw "desktop shortcut was not created" }
+          if (-not (Test-Path "$([Environment]::GetFolderPath('Programs'))\Bose Soundbar.lnk")) { throw "start menu entry was not created" }
+          python scripts/smoke_test_exe.py $exe
+          $u = Start-Process (Join-Path $dir 'unins000.exe') -PassThru -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          $u.WaitForExit()
+          # Inno's uninstaller hands off to a temporary copy of itself and returns at once, so wait for the files to go.
+          $deadline = (Get-Date).AddSeconds(90)
+          while ((Test-Path $exe) -and (Get-Date) -lt $deadline) { Start-Sleep 1 }
+          Start-Sleep 2
+          if (Test-Path $exe) { throw "uninstall left the exe behind" }
+          if (Test-Path "$desktop\Bose Soundbar.lnk") { throw "uninstall left the desktop shortcut behind" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: |
+            dist-installer/*.exe
+          if-no-files-found: error
+          retention-days: 7

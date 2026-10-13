@@ -1,0 +1,9 @@
+pybose==2026.10.2
+customtkinter==6.0.0
+requests==2.34.2
+PyJWT==2.15.1
+cryptography==50.0.2
+pystray==0.19.5
+pillow==12.3.0
+zeroconf==0.151.5
+websockets==17.2

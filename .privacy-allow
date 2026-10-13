@@ -1,0 +1,14 @@
+# Values the privacy check should NOT flag. Add only fake or harmless values, one per line, exact match.
+# (Real personal data must never be added here: this file is public.)
+
+# Fake addresses used by the tests and as input placeholders
+192.168.1.50
+192.168.1.77
+192.168.1.99
+10.9.8.7
+
+# The Inno Setup AppId: a fixed, public application identifier, not a device or account
+B7C2F1A4-5D3E-4C8B-9A61-2E4F7D8C3A10
+
+# The privacy tests deliberately contain fake leaks to prove the scanner catches them
+file: tests/test_privacy.py

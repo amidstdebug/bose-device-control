@@ -1,0 +1,7 @@
+-r requirements.txt
+pytest==9.1.1
+pytest-cov==7.1.0
+ruff==0.17.0
+pyinstaller==6.22.3
+PyYAML==6.0.3
+pytest-timeout==2.4.0
