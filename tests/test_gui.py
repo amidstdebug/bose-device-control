@@ -947,3 +947,24 @@ def test_about_shows_this_project_first_then_credits_pybose(make_app, monkeypatc
     find_button(app.settings, project).invoke()
     find_button(app.settings, "pybose by cavefire").invoke()
     assert opened == [b.PROJECT_URL, b.PYBOSE_URL]
+
+
+def test_a_stale_refresh_never_overwrites_a_newer_one(make_app):
+    app = make_app()
+    vol = {"value": 20, "muted": False}
+    app._apply_if_newest(10, vol, now_playing_spotify(title="Newest"), "OFF")
+    app._apply_if_newest(9, vol, now_playing_spotify(title="Older, finished late"), "ON")
+    assert app.title_lbl.cget("text") == "Newest" and not app.power_on
+    app._apply_if_newest(11, vol, now_playing_spotify(title="Even newer"), "ON")
+    assert app.title_lbl.cget("text") == "Even newer" and app.power_on
+
+
+def test_overlapping_refreshes_end_on_the_latest_state(make_app):
+    app = make_app()
+    sp = last_speaker()
+    sp.power = "OFF"
+    for _ in range(6):
+        app.run(app._refresh())
+    assert pump(app, lambda: not app.power_on)
+    settle(app, 0.3)
+    assert not app.power_on, "an older refresh must not flip it back"

@@ -333,6 +333,8 @@ class App(ctk.CTk):
         self._last = None
         self._volume_job = None
         self._refresh_pending = False
+        self._refresh_seq = 0      # numbers each refresh by when it started...
+        self._applied_seq = 0      # ...so a slow, older one can never overwrite a newer result
         self._view = None
         self._main_view = "login"
         self._status = ("Starting...", MUTED, MUTED)
@@ -1360,6 +1362,8 @@ class App(ctk.CTk):
     async def _refresh(self, sources=False):
         if not self.speaker:
             return
+        self._refresh_seq += 1
+        seq = self._refresh_seq
         vol = await self.speaker.get_audio_volume()
         try:
             np = await self.speaker.get_now_playing()
@@ -1382,7 +1386,15 @@ class App(ctk.CTk):
                 self.ui(self._render_source_settings)
             except Exception as e:
                 logging.info("sources unavailable: %s", e)
-        self.ui(self._apply, vol, np, power)
+        self.ui(self._apply_if_newest, seq, vol, np, power)
+
+    def _apply_if_newest(self, seq, vol, np, power):
+        """Two refreshes can be in flight at once (a button press and a push notification, say). Whichever
+        STARTED last wins, even if an older one finishes after it."""
+        if seq < self._applied_seq:
+            return
+        self._applied_seq = seq
+        self._apply(vol, np, power)
 
     def _apply(self, vol, np, power="ON"):
         self._last = (vol, np, power)
