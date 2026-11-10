@@ -1,22 +1,56 @@
-"""Launches the packaged .exe and checks it really starts: a window appears, it stays up, a second launch defers to
-the first, and nothing crashed. Runs against dist/ in CI and against the installed copy in the installer test.
+"""Launches the packaged app and checks it really starts: a window appears, it stays up, a second launch defers to
+the first, it quits cleanly, and nothing crashed. Runs against dist/ in CI and against the installed copy in the
+installer test, on Windows and on Linux (there it needs a display, e.g. xvfb-run).
 
-Usage: python scripts/smoke_test_exe.py path\\to\\BoseSoundbarRemote.exe
+Usage: python scripts/smoke_test_exe.py path/to/BoseSoundbarRemote[.exe]
 The app is started with an isolated data folder and invisible windows, so it never touches real settings.
 """
-import ctypes
 import os
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-from ctypes import wintypes
 from pathlib import Path
+
+IS_WIN = sys.platform == "win32"
 
 
 def windows_of(pid):
     """Titles of visible top-level windows owned by `pid`."""
+    return _windows_of_win32(pid) if IS_WIN else _windows_of_x11(pid)
+
+
+def _windows_of_x11(pid):
+    from Xlib import X, display
+    d = display.Display()
+    try:
+        net_pid, net_name = d.intern_atom("_NET_WM_PID"), d.intern_atom("_NET_WM_NAME")
+        found = []
+
+        def walk(win):
+            try:
+                # Tk does not always set _NET_WM_PID, so a window counts unless it names a different process
+                # (the test runs on its own virtual display, where nothing else opens windows)
+                owner = win.get_full_property(net_pid, X.AnyPropertyType)
+                if owner is None or not owner.value or int(owner.value[0]) == pid:
+                    name = win.get_full_property(net_name, X.AnyPropertyType)
+                    title = name.value.decode("utf-8", "replace") if name is not None else (win.get_wm_name() or "")
+                    if title and win.get_attributes().map_state != X.IsUnmapped:
+                        found.append(title)
+                for child in win.query_tree().children:
+                    walk(child)
+            except Exception:  # windows come and go while we look
+                pass
+        walk(d.screen().root)
+        return found
+    finally:
+        d.close()
+
+
+def _windows_of_win32(pid):
+    import ctypes
+    from ctypes import wintypes
     user32 = ctypes.windll.user32
     found = []
 
@@ -93,8 +127,17 @@ def main(exe):
         if "Traceback" in text:
             fail("the log contains a traceback:\n" + text[-2000:])
         print("ok: no tracebacks in the log")
+
+        if not IS_WIN:  # asked to stop (as at log-out), the app must go away promptly and free its port
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                fail("did not exit within 10 s of being asked to")
+            print("ok: exits when asked to")
     finally:
-        proc.kill()
+        if proc.poll() is None:
+            proc.kill()
         proc.wait()
     print("SMOKE TEST PASSED")
 

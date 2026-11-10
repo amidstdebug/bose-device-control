@@ -74,11 +74,22 @@ class FakeSpeaker:
         self.now_playing = now_playing_spotify()
         self.sources = SOURCES
         self.name = "Living Room"
+        self.connects = 0
+        self.broken = None           # an exception every request raises until the next successful connect()
+        self.heal_on_connect = True  # False: reconnecting doesn't help (the speaker stays unreachable)
+        self.fail_next = []          # exceptions raised by the next commands, one each
         FakeSpeaker.instances.append(self)
+
+    def _check(self):
+        if self.broken is not None:
+            raise self.broken
 
     async def connect(self):
         if FakeSpeaker.fail_connect:
             raise ConnectionRefusedError("connection refused")
+        self.connects += 1
+        if self.heal_on_connect:
+            self.broken = None
         self.connected = True
 
     async def disconnect(self):
@@ -96,6 +107,7 @@ class FakeSpeaker:
         return {"name": self.name, "productName": "Bose Soundbar 700", "productType": "test"}
 
     async def get_audio_volume(self):
+        self._check()
         return {"value": self.volume, "muted": self.muted, "min": 0, "max": 100}
 
     async def set_audio_volume(self, v):
@@ -125,6 +137,9 @@ class FakeSpeaker:
         self.calls.append(("pause",))
 
     async def skip_next(self):
+        if self.fail_next:
+            raise self.fail_next.pop(0)
+        self._check()
         self.calls.append(("skip_next",))
 
     async def skip_previous(self):

@@ -208,3 +208,23 @@ def test_release_notes_introduce_the_app_before_crediting_pybose():
     assert "Built on [pybose]" not in text, "wording made the app sound like it was called pybose"
     assert "name: v${{ needs.plan.outputs.version }}" in text, "the release is titled with just the version, like its tag"
     assert "name: Bose Soundbar Remote v" not in text
+
+
+def test_linux_is_built_tested_and_released_alongside_windows():
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    assert {"test-linux", "build-linux"} <= set(ci["jobs"])
+    rel_text = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    rel = yaml.safe_load(rel_text)
+    assert "linux" in rel["jobs"] and "linux" in rel["jobs"]["release"]["needs"], "the release must wait for the tarball"
+    assert "linux-release" in rel_text and "package_linux.py" in rel_text
+    assert rel_text.index("linux-release", rel_text.index("download-artifact")) < rel_text.index("SHA256SUMS.txt", rel_text.index("download-artifact")), \
+        "the tarball must be in release/ before the checksums are written"
+    for name in ("icons\\.py", "package_linux"):
+        assert name in rel_text, f"a change to {name} must trigger a release"
+    assert not updater.INSTALLER_RE.search("BoseSoundbarRemote-1.2.3-linux-x86_64.tar.gz"), \
+        "the Windows updater must never pick the Linux tarball as its installer"
+
+
+def test_coverage_and_packaging_know_about_every_app_module():
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"icons"' in pyproject

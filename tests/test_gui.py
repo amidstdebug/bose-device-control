@@ -20,6 +20,9 @@ if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
     pytest.skip("no display available for Tk", allow_module_level=True)
 
 TOKEN = {"access_token": "a", "refresh_token": "r", "bose_person_id": "p"}
+# the integration card is worded for the desktop it runs on
+PLATFORM_LABELS = (("Start menu entry", "Run when I sign in to Windows", "Pin to taskbar") if b.IS_WIN
+                   else ("Applications menu entry", "Run when I sign in", "Interface size"))
 
 
 def alive(app):
@@ -322,11 +325,11 @@ def test_now_playing_text_and_play_button(make_app):
     assert app.title_lbl.cget("text") == "Fireplace"
     assert app.sub_lbl.cget("text") == "Sleepy Fish · Beneath Your Waves"
     assert "PLAYING FROM SPOTIFY" in app.src_badge.cget("text")
-    assert app.playing and app.play_btn.cget("text") == app.icon("", "⏸")
+    assert app.playing and app.play_btn.icon_name == "pause"
     last_speaker().now_playing = now_playing_spotify(status="PAUSE")
     app.run(app._refresh())
     assert pump(app, lambda: not app.playing)
-    assert app.play_btn.cget("text") == app.icon("", "▶")
+    assert app.play_btn.icon_name == "play"
 
 
 def test_tv_input_shows_its_name_without_a_track(make_app):
@@ -623,7 +626,7 @@ def test_settings_page_has_every_control(make_app):
     shown = " | ".join(texts(app.settings))
     for needle in ("Display name", "Mode", "Accent colour", "Always on top", "When I close the window",
                    "Start minimized at sign-in", "Remember window position", "Keyboard shortcuts",
-                   "Desktop shortcut", "Start menu entry", "Run when I sign in to Windows", "Pin to taskbar",
+                   "Desktop shortcut", *PLATFORM_LABELS,
                    "Maximum volume", "Keyboard volume step", "Speaker IP address", "Show error messages",
                    "Check for updates at startup", "Open data folder", "Reset settings", "Re-scan network",
                    "Reconnect", "Log out", "pybose by cavefire", "Speaker control is done by pybose"):
@@ -688,7 +691,7 @@ def test_always_on_top_applies_immediately(make_app):
     app = make_app()
     app.set("always_on_top", True)
     app.attributes("-topmost", True)
-    assert bool(app.attributes("-topmost"))
+    assert pump(app, lambda: bool(app.attributes("-topmost")), timeout=3)  # X11: the window manager applies it
 
 
 def test_reset_settings_restores_defaults(make_app):
@@ -764,6 +767,7 @@ def test_close_to_tray_hides_and_show_restores(make_app, monkeypatch):
             Icon.stopped = True
     fake = types.SimpleNamespace(Icon=Icon, Menu=lambda *a: a, MenuItem=lambda *a, **k: (a, k))
     monkeypatch.setitem(sys.modules, "pystray", fake)
+    monkeypatch.setattr(b, "tray_available", lambda: True)
     app = make_app(settings={"close_action": "Minimize to tray"})
     app._on_close()
     settle(app, 0.2)
@@ -900,6 +904,7 @@ def test_view_release_opens_the_browser(make_app, monkeypatch):
 
 def test_packaged_app_downloads_launches_installer_and_exits(make_app, monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(b, "CAN_SELF_UPDATE", True)  # the one-click installer exists for Windows only
     launched = []
     installer = tmp_path / "Setup.exe"
     installer.write_bytes(b"x")
@@ -914,6 +919,7 @@ def test_packaged_app_downloads_launches_installer_and_exits(make_app, monkeypat
 
 def test_failed_update_download_is_reported_and_app_keeps_running(make_app, monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(b, "CAN_SELF_UPDATE", True)
 
     def boom(info, directory, **k):
         raise ValueError("downloaded installer failed its checksum check")

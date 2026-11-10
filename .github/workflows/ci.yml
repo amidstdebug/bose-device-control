@@ -53,6 +53,67 @@ jobs:
             test-results.xml
             coverage.xml
 
+  test-linux:
+    name: Tests on Linux (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Virtual display and a window manager (minimize / always-on-top need one)
+        run: sudo apt-get update && sudo apt-get install -y xvfb openbox libtk8.6
+      - run: pip install -r requirements-dev.txt
+      - name: Run the test suite
+        timeout-minutes: 25
+        run: xvfb-run -a sh -c 'openbox >/dev/null 2>&1 & sleep 1; exec pytest tests -v --durations=15 --junitxml=test-results.xml'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-linux
+          path: test-results.xml
+
+  build-linux:
+    name: Linux build, smoke-test and install-test
+    needs: [lint, test-linux]
+    runs-on: ubuntu-22.04   # the oldest runner: the build then also runs on older distributions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: sudo apt-get update && sudo apt-get install -y xvfb openbox libtk8.6
+      - run: pip install -r requirements-dev.txt
+      - name: Build the app
+        run: python scripts/build_exe.py
+      - name: Smoke-test it (starts, shows a window, single instance, exits cleanly, no tracebacks)
+        run: xvfb-run -a sh -c 'openbox >/dev/null 2>&1 & sleep 1; exec python scripts/smoke_test_exe.py dist/BoseSoundbarRemote/BoseSoundbarRemote'
+      - name: Package the tarball
+        run: python scripts/package_linux.py
+      - name: Install from the tarball, run the installed app, then uninstall
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          tar -xzf dist-installer/BoseSoundbarRemote-*-linux-*.tar.gz -C "$work"
+          export HOME="$work/home"; mkdir -p "$HOME"
+          sh "$work"/BoseSoundbarRemote-*/install.sh
+          test -x "$HOME/.local/opt/BoseSoundbarRemote/BoseSoundbarRemote"
+          test -f "$HOME/.local/share/applications/bose-soundbar-remote.desktop"
+          xvfb-run -a sh -c 'openbox >/dev/null 2>&1 & sleep 1; exec python scripts/smoke_test_exe.py "$HOME/.local/bin/bose-soundbar-remote"'
+          sh "$work"/BoseSoundbarRemote-*/uninstall.sh --purge
+          test ! -e "$HOME/.local/opt/BoseSoundbarRemote"
+          test ! -e "$HOME/.local/share/applications/bose-soundbar-remote.desktop"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: dist-installer/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     name: Build, smoke-test and installer-test
     needs: [lint, test]

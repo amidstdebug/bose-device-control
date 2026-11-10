@@ -40,7 +40,7 @@ SECRETS = {
     "Bearer token": re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{30,}"),
 }
 HARMLESS_HOME_NAMES = {"public", "default", "all users", "default user", "user", "username", "name", "you", "me",
-                       "runner", "runneradmin", "<user>", "your-name", "yourname"}
+                       "runner", "runneradmin", "<user>", "your-name", "yourname", "root"}
 HARMLESS_EMAIL_DOMAINS = ("example.com", "example.org", "example.net", "users.noreply.github.com", "noreply.github.com",
                           "bose.com", "localhost")
 DOC_NETWORKS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
