@@ -1,8 +1,10 @@
 """Bose Soundbar remote: customtkinter UI on top of pybose (https://github.com/cavefire/pybose)."""
 import asyncio
 import ctypes
+import gc
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import shutil
@@ -24,6 +26,16 @@ from pybose.BoseAuth import BoseAuth
 from pybose.BoseDiscovery import BoseDiscovery
 from pybose.BoseSpeaker import BoseSpeaker
 
+try:
+    from pybose.BoseAuth import BoseAuthRejectedError, BoseAuthUnavailableError
+except ImportError:  # older pybose: these failures were plain ValueErrors
+    class BoseAuthRejectedError(ValueError):
+        pass
+
+    class BoseAuthUnavailableError(ValueError):
+        pass
+
+import icons
 import updater
 from build_info import REPO
 from build_info import VERSION as BUILD_VERSION
@@ -43,6 +55,17 @@ PYBOSE_URL = "https://github.com/cavefire/pybose"  # the library that talks to t
 AUMID = "BoseSoundbarRemote.App"  # gives the taskbar its own identity/icon instead of Python's
 SINGLE_INSTANCE_PORT = int(os.environ.get("BOSE_REMOTE_PORT") or 47653)
 POLL_SECONDS = 5  # safety-net refresh interval (tests shorten it)
+HIDDEN_POLL_FACTOR = 6     # minimized / in the tray: poll this many times less often (pushes still arrive live)
+MAX_RETRY_SECONDS = 60     # ceiling for the back-off while the speaker can't be reached
+FIRST_RETRY_SECONDS = 10   # first background retry after a failed connection attempt; doubles from there
+LOGIN_RETRY_SECONDS = 5    # first retry when the login can't be renewed because there is no internet yet
+CONNECT_TIMEOUT = 25       # seconds before a connection attempt is abandoned
+SUBNET_SCAN_EVERY = 600    # while retrying in the background, port-scan the subnet at most this often (seconds)
+MAX_ERROR_LINES = 300      # the error panel keeps only this many lines
+
+IS_WIN = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+CAN_SELF_UPDATE = IS_WIN   # one-click updates run the Windows installer; elsewhere the banner links to the release
 
 
 def resource(rel):
@@ -52,10 +75,20 @@ def resource(rel):
 
 ICON = resource("assets/icon.ico")
 
-# Per-user data dir so it works the same from source and from the packaged .exe.
-DATA_DIR = Path(os.environ.get("BOSE_REMOTE_DATA_DIR")
-                or Path(os.environ.get("APPDATA", Path.home())) / "BoseSoundbarRemote")
+def default_data_dir():
+    """Per-user data dir, the same from source and from the packaged app: %APPDATA% on Windows, XDG config on Linux."""
+    if IS_WIN:
+        return Path(os.environ.get("APPDATA") or Path.home()) / "BoseSoundbarRemote"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "BoseSoundbarRemote"
+
+
+DATA_DIR = Path(os.environ.get("BOSE_REMOTE_DATA_DIR") or default_data_dir())
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+if not IS_WIN:
+    try:
+        DATA_DIR.chmod(0o700)  # it holds login tokens
+    except OSError:
+        pass
 CONFIG = DATA_DIR / "bose_config.json"  # tokens, speaker address, settings (never the password)
 LOGFILE = DATA_DIR / "bose_app.log"
 
@@ -63,8 +96,47 @@ _OLD_CONFIG = Path(__file__).parent / "bose_config.json"  # from earlier dev run
 if _OLD_CONFIG.exists() and not CONFIG.exists():
     shutil.move(str(_OLD_CONFIG), str(CONFIG))
 
-logging.basicConfig(filename=LOGFILE, level=logging.INFO, encoding="utf-8", force=True,
-                    format="%(asctime)s %(levelname)s %(message)s")
+
+
+class _DedupFilter(logging.Filter):
+    """Drops a message that repeats the previous one, then says how often it repeated.
+
+    A speaker that is switched off produces the same failure on every retry, for days if the app sits in the tray;
+    without this the log is the same line a hundred thousand times.
+    """
+
+    def __init__(self, window=600):
+        super().__init__()
+        self.window, self._last, self._count, self._since = window, None, 0, 0.0
+
+    def filter(self, record):
+        try:
+            key = (record.levelno, record.getMessage())
+        except Exception:
+            return True
+        now = time.monotonic()
+        if key == self._last and now - self._since < self.window:
+            self._count += 1
+            return False
+        if self._count:
+            record.msg = f"(previous message repeated {self._count} more times)\n{record.getMessage()}"
+            record.args = None
+        self._last, self._count, self._since = key, 0, now
+        return True
+
+
+def setup_logging():
+    """Log to a file that can never grow without bound: 1 MB, two older files kept."""
+    handler = logging.handlers.RotatingFileHandler(LOGFILE, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+    handler.addFilter(_DedupFilter())
+    logging.basicConfig(handlers=[handler], level=logging.INFO, force=True,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    # these libraries narrate every connection at INFO; only their problems are interesting
+    for noisy in ("websockets", "zeroconf", "pybose", "urllib3", "PIL"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+setup_logging()
 
 # (light, dark) tuples: customtkinter switches between them live when the appearance mode changes
 BG = ("#f1f3f6", "#0f1115")
@@ -75,7 +147,10 @@ MUTED = ("#6b7280", "#8b93a1")
 TEXT = ("#111827", "#e8eaed")
 RED = ("#dc2626", "#f87171")
 GREEN = ("#16a34a", "#4ade80")
-SYMBOL = "Segoe UI Symbol"
+
+# glyph in the Windows icon fonts -> the drawn icon (icons.py) used where those fonts don't exist
+ICON_NAMES = {"\ue713": "settings", "\ue7e8": "power", "\ue892": "prev", "\ue893": "next", "\ue768": "play",
+              "\ue769": "pause", "\ue767": "volume", "\ue74f": "muted", "\ue72b": "back"}
 
 ACCENTS = {
     "Blue": "#3b82f6", "Teal": "#14b8a6", "Green": "#22c55e", "Purple": "#8b5cf6",
@@ -96,6 +171,7 @@ DEFAULTS = {
     "volume_step": 5,
     "check_updates": True,     # look for a newer release on GitHub at startup
     "hidden_sources": [],      # "SOURCE|account" keys the user hid from the main screen
+    "ui_scale": 100,           # interface size in percent (Linux; Windows follows the display scaling by itself)
     "window_pos": "",
 }
 CLOSE_ACTIONS = ["Minimize to taskbar", "Minimize to tray", "Exit"]
@@ -108,8 +184,42 @@ def load_config():
         return {}
 
 
+_config_lock = threading.Lock()
+
+
 def save_config(cfg):
-    CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    """Write the config atomically (temp file + rename), so a crash or power cut mid-write can't leave a half-written
+    file that logs the user out and resets every setting. Safe to call from any thread. Returns True on success."""
+    with _config_lock:
+        for _attempt in range(3):
+            try:
+                text = json.dumps(cfg, indent=2)
+                break
+            except RuntimeError:  # another thread changed the dict while it was being serialised
+                time.sleep(0.01)
+        else:
+            return False
+        tmp = CONFIG.with_name(CONFIG.name + ".tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            if not IS_WIN:
+                tmp.chmod(0o600)  # tokens: readable by this user only
+            for attempt in range(4):
+                try:
+                    os.replace(tmp, CONFIG)
+                    break
+                except PermissionError:  # Windows: a virus scanner or backup tool has the file open for a moment
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.05)
+            return True
+        except OSError as e:
+            logging.warning("could not save settings: %s", e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
 
 
 def darken(hex_color, f=0.82):
@@ -118,51 +228,150 @@ def darken(hex_color, f=0.82):
     return "#%02x%02x%02x" % (int(r * f), int(g * f), int(b * f))
 
 
-# ---------------------------------------------------------------- Windows shortcuts
+# ---------------------------------------------------------------- shortcuts / autostart
+DESKTOP_FILE = "bose-soundbar-remote.desktop"  # Linux launcher file name
+
+
 def _known_folder(csidl):
     buf = ctypes.create_unicode_buffer(260)
     ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf)
     return Path(buf.value)
 
 
+def _xdg_desktop_dir():
+    """The user's Desktop folder on Linux (it is translated on non-English systems, e.g. ~/Bureau)."""
+    try:
+        r = subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return Path.home() / "Desktop"
+
+
 def shortcut_path(kind):
+    if kind not in ("desktop", "start", "startup"):
+        raise ValueError(kind)
+    if not IS_WIN:
+        if kind == "desktop":
+            return _xdg_desktop_dir() / DESKTOP_FILE
+        if kind == "start":
+            return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "applications" / DESKTOP_FILE
+        return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "autostart" / DESKTOP_FILE
     name = f"{APP_NAME}.lnk"
     if kind == "desktop":
         return _known_folder(0x10) / name                       # CSIDL_DESKTOPDIRECTORY
     if kind == "start":
         return _known_folder(0x02) / name                       # CSIDL_PROGRAMS (user Start menu > Programs)
-    if kind == "startup":
-        return _known_folder(0x07) / name                       # CSIDL_STARTUP
-    raise ValueError(kind)
+    return _known_folder(0x07) / name                           # CSIDL_STARTUP
+
+
+def shortcut_exists(kind):
+    try:
+        return shortcut_path(kind).exists()
+    except Exception:  # no such folder on this system
+        return False
 
 
 def launch_spec():
     """(target, arguments, working dir, icon) that launches this app."""
     if getattr(sys, "frozen", False):
-        return sys.executable, "", str(Path(sys.executable).parent), f"{sys.executable},0"
+        icon = f"{sys.executable},0" if IS_WIN else str(linux_icon_file())
+        return sys.executable, "", str(Path(sys.executable).parent), icon
     script = Path(__file__).resolve()
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    return str(pythonw), f'"{script}"', str(script.parent), str(ICON)
+    if IS_WIN:
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        return str(pythonw), f'"{script}"', str(script.parent), str(ICON)
+    return sys.executable, f'"{script}"', str(script.parent), str(linux_icon_file())
+
+
+def linux_icon_file():
+    """A PNG of the app icon for .desktop files (they can't use .ico); written once into the data folder."""
+    png = DATA_DIR / "icon.png"
+    if not png.exists():
+        try:
+            img = _PILImage.open(ICON)
+            img.size = max(img.info.get("sizes", [img.size]))  # the largest picture stored in the .ico
+            img.convert("RGBA").save(png, "PNG")
+        except Exception as e:
+            logging.info("could not write the launcher icon: %s", e)
+    return png
+
+
+def _desktop_quote(arg):
+    """Quote one argument for the Exec= key of a .desktop file."""
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$") + '"'
+
+
+def desktop_entry(target, args, workdir, icon, minimized=False):
+    """Contents of a freedesktop.org launcher (.desktop file) for this app."""
+    exec_line = _desktop_quote(target) + (f" {args}" if args else "") + (" --minimized" if minimized else "")
+    return "\n".join([
+        "[Desktop Entry]", "Type=Application", "Version=1.0", f"Name={APP_NAME}",
+        "GenericName=Speaker remote", "Comment=Remote control for Bose speakers and soundbars",
+        f"Exec={exec_line}", f"Path={workdir}", f"Icon={icon}", "Terminal=false",
+        "Categories=AudioVideo;Audio;", "StartupWMClass=BoseSoundbarRemote", "StartupNotify=false",
+        *(["X-GNOME-Autostart-enabled=true"] if minimized else []), "",
+    ])
 
 
 def create_shortcut(kind):
     target, args, workdir, icon = launch_spec()
-    if kind == "startup":
-        args = (args + " --minimized").strip()
     lnk = shortcut_path(kind)
     lnk.parent.mkdir(parents=True, exist_ok=True)
+    if not IS_WIN:
+        lnk.write_text(desktop_entry(target, args, workdir, icon, minimized=kind == "startup"), encoding="utf-8")
+        lnk.chmod(0o755)  # desktops refuse to launch a .desktop file that isn't executable
+        if kind == "desktop":  # GNOME additionally wants the file marked as trusted
+            try:
+                subprocess.run(["gio", "set", str(lnk), "metadata::trusted", "true"], capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return
+    if kind == "startup":
+        args = (args + " --minimized").strip()
     ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:B_LNK);"
           "$s.TargetPath=$env:B_TGT;$s.Arguments=$env:B_ARGS;$s.WorkingDirectory=$env:B_WD;"
           "$s.IconLocation=$env:B_ICON;$s.Description='Bose Soundbar Remote';$s.Save()")
     env = {**os.environ, "B_LNK": str(lnk), "B_TGT": target, "B_ARGS": args, "B_WD": workdir, "B_ICON": icon}
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], env=env,
-                       capture_output=True, text=True, creationflags=0x08000000)
+                       capture_output=True, text=True, creationflags=0x08000000, timeout=60)
     if r.returncode != 0 or not lnk.exists():
         raise RuntimeError(r.stderr.strip() or "PowerShell failed to create the shortcut")
 
 
 def remove_shortcut(kind):
     shortcut_path(kind).unlink(missing_ok=True)
+
+
+def open_path(path):
+    """Open a folder or file in the desktop's file manager / default app."""
+    if IS_WIN:
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def tray_available():
+    """Can a tray icon actually be shown? On Windows always. On Linux only if something owns the X11 system tray;
+    plain GNOME has none, and hiding the window there would leave no way to get it back."""
+    if IS_WIN:
+        return True
+    if not os.environ.get("DISPLAY"):
+        return False
+    try:
+        from Xlib import X
+        from Xlib import display as xdisplay
+        d = xdisplay.Display()
+        try:
+            atom = d.intern_atom(f"_NET_SYSTEM_TRAY_S{d.get_default_screen()}")
+            return d.get_selection_owner(atom) != X.NONE
+        finally:
+            d.close()
+    except Exception as e:
+        logging.info("no system tray: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------- networking helper
@@ -191,7 +400,7 @@ def scan_subnet(port=8082, prefix=None):
         finally:
             c.close()
 
-    with ThreadPoolExecutor(100) as ex:
+    with ThreadPoolExecutor(64) as ex:
         return [ip for ip in ex.map(check, range(1, 255)) if ip]
 
 
@@ -200,6 +409,8 @@ def acquire_single_instance(port=None):
     port = port or SINGLE_INSTANCE_PORT
     srv = socket.socket()
     try:
+        if IS_WIN:  # without this, a second process could bind the same port on Windows and both would run
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         srv.bind(("127.0.0.1", port))
         srv.listen(2)
         return srv
@@ -279,22 +490,71 @@ def fetch_image(url, limit=6_000_000):
     if not url.lower().startswith("https://"):
         raise ValueError("refusing non-https image url")
     r = requests.get(url, timeout=8, stream=True)
-    r.raise_for_status()
-    data = r.raw.read(limit + 1, decode_content=True)
+    try:
+        r.raise_for_status()
+        data = r.raw.read(limit + 1, decode_content=True)
+    finally:
+        r.close()  # a streamed response keeps its connection until closed
     if len(data) > limit:
         raise ValueError("image too large")
     return data
+
+
+def system_theme():
+    """"Dark" or "Light", whatever the desktop is set to."""
+    try:
+        import darkdetect
+        return "Dark" if darkdetect.theme() == "Dark" else "Light"
+    except Exception:
+        return "Light"
+
+
+def set_ui_scale(percent):
+    """Interface size for Linux, where customtkinter doesn't follow the display scaling by itself."""
+    try:
+        scale = max(0.5, min(3.0, int(percent or 100) / 100))
+    except (TypeError, ValueError):
+        scale = 1.0
+    tracker = getattr(ctk, "ScalingTracker", None)
+    if tracker is not None and getattr(tracker, "widget_scaling", None) == scale \
+            and getattr(tracker, "window_scaling", None) == scale:
+        return  # nothing to change; rescaling redraws every widget
+    ctk.set_widget_scaling(scale)
+    ctk.set_window_scaling(scale)
+
+
+def tune_toolkit():
+    """customtkinter runs two housekeeping timers for as long as a window exists: one looks for a dark/light switch
+    every 30 ms, one for a display-scaling change every 100 ms. Nobody needs either that often, and they keep the
+    process waking up dozens of times a second even while it sits in the tray."""
+    for name, interval in (("AppearanceModeTracker", 1000), ("ScalingTracker", 500)):
+        tracker = getattr(ctk, name, None)
+        if tracker is not None and hasattr(tracker, "update_loop_interval"):
+            tracker.update_loop_interval = interval
 
 
 class App(ctk.CTk):
     def __init__(self, instance_sock, start_hidden):
         self.cfg = load_config()
         self.s = {**DEFAULTS, **self.cfg.get("settings", {})}
-        ctk.set_appearance_mode(self.s["appearance"])
-        super().__init__(fg_color=BG)
+        tune_toolkit()
+        # Outside Windows, "System" is resolved here and re-checked in the background (see _watch_system_theme):
+        # customtkinter's own check starts a `gsettings` process from the UI thread on every tick.
+        self._sys_theme = "Light" if IS_WIN or self.s["appearance"] != "System" else system_theme()
+        ctk.set_appearance_mode(self._appearance())
+        if IS_LINUX:
+            set_ui_scale(self.s.get("ui_scale"))
+        # className sets WM_CLASS, which is how Linux desktops match the window to its launcher/icon
+        super().__init__(fg_color=BG, **({} if IS_WIN else {"className": "BoseSoundbarRemote"}))
         if os.environ.get("BOSE_REMOTE_TEST_HIDDEN"):  # automated tests: fully transparent, no taskbar button
             self.attributes("-alpha", 0.0)
-            self.attributes("-toolwindow", True)
+            if IS_WIN:
+                self.attributes("-toolwindow", True)
+        self._visible = True       # False while minimized or hidden in the tray: timers and polling slow down
+        self._closing = False
+        self._timers = {}          # name -> id of each repeating timer, so quitting can cancel them
+        self._icon_photo = None
+        self._icon_cache = {}
         self._init_fonts()
         self.accent = ACCENTS.get(self.s["accent"], ACCENTS["Blue"])
         self.accent_hover = darken(self.accent)
@@ -339,10 +599,17 @@ class App(ctk.CTk):
         self._main_view = "login"
         self._status = ("Starting...", MUTED, MUTED)
         self.tray = None
+        self._prog_shown = False
+        self._instance_sock = instance_sock
+        self._conn_gen = 0         # bumped by every connect/disconnect, so stale retries know to stop
+        self._retry_n = 0
+        self._last_scan = 0.0
+        self._conn_lock = asyncio.Lock()  # one connection attempt at a time (only ever used on the asyncio thread)
+        self._gc_runs = 0
 
         self._ui_queue = queue.Queue()
         self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        threading.Thread(target=self.loop.run_forever, daemon=True, name="bose-asyncio").start()
         self.report_callback_exception = self._tk_exception
 
         self._build_all()
@@ -350,21 +617,61 @@ class App(ctk.CTk):
         self._bind_keys()
         self._tick()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Map>", self._on_map_change, add=True)
+        self.bind("<Unmap>", self._on_map_change, add=True)
+
+        # Tk objects (fonts, images, variables) talk to Tk when they are freed, and Tk may only be used from this
+        # thread. Python's garbage collector runs on whichever thread happens to allocate, so left alone it would
+        # free them on the network thread, which then stalls one second per object whenever this thread is busy.
+        # So: automatic collection off, and this thread collects on a timer instead.
+        gc.disable()
+        self._every("gc", 5000, self._gc_tick)
 
         if instance_sock:
-            threading.Thread(target=self._instance_listener, args=(instance_sock,), daemon=True).start()
+            threading.Thread(target=self._instance_listener, args=(instance_sock,), daemon=True,
+                             name="bose-single-instance").start()
+        if not IS_WIN:
+            self.run(self._watch_system_theme(), "Theme watcher failed")
         if start_hidden:
             self.after(400, self._minimize_on_start)
         self.run(self._startup())
 
     # ------------------------------------------------------------ fonts / icons
+    def _appearance(self):
+        """The mode to hand to customtkinter: the setting itself, except "System" outside Windows (resolved here)."""
+        mode = self.s["appearance"]
+        return self._sys_theme if (mode == "System" and not IS_WIN) else mode
+
+    async def _watch_system_theme(self):
+        """Linux: follow the desktop's dark/light switch without blocking the window (the check runs a program)."""
+        while not self._closing:
+            await asyncio.sleep(15)
+            if self.s["appearance"] != "System":
+                continue
+            theme = await asyncio.to_thread(system_theme)
+            if theme != self._sys_theme and self.s["appearance"] == "System":
+                self._sys_theme = theme
+                self.ui(ctk.set_appearance_mode, theme)
+
     def _init_fonts(self):
         fams = set(tkfont.families(self))
-        self.body_font = next((f for f in ("Segoe UI Variable Text", "Segoe UI") if f in fams), "Arial")
-        self.head_font = next((f for f in ("Segoe UI Variable Display", "Segoe UI") if f in fams), self.body_font)
+        if IS_WIN:
+            body = ("Segoe UI Variable Text", "Segoe UI")
+            head = ("Segoe UI Variable Display", "Segoe UI")
+            mono = ("Cascadia Mono", "Consolas")
+            fallback = "Arial"
+        else:
+            body = head = ("Inter", "Noto Sans", "Ubuntu", "Cantarell", "Adwaita Sans", "Open Sans", "Roboto",
+                           "DejaVu Sans", "Liberation Sans", "Helvetica Neue", "Helvetica")
+            mono = ("JetBrains Mono", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono", "Ubuntu Mono", "Menlo")
+            fallback = "sans-serif" if IS_LINUX else "Helvetica"
+        self.body_font = next((f for f in body if f in fams), fallback)
+        self.head_font = next((f for f in head if f in fams), self.body_font)
+        self.mono_font = next((f for f in mono if f in fams), "monospace" if IS_LINUX else "Courier")
         self.icon_font = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in fams), None)
-        # make every widget default to the Windows UI font instead of customtkinter's Roboto/Arial
-        ctk.ThemeManager.theme["CTkFont"]["Windows"] = {"family": self.body_font, "size": 13, "weight": "normal"}
+        # make every widget default to the system UI font instead of customtkinter's Roboto/Arial
+        key = "Windows" if IS_WIN else "macOS" if sys.platform == "darwin" else "Linux"
+        ctk.ThemeManager.theme["CTkFont"][key] = {"family": self.body_font, "size": 13, "weight": "normal"}
 
     def F(self, size=13, bold=False, head=False):
         return ctk.CTkFont(family=self.head_font if head else self.body_font, size=size,
@@ -376,15 +683,88 @@ class App(ctk.CTk):
     def icon(self, glyph, fallback):
         return glyph if self.icon_font else fallback
 
-    # ------------------------------------------------------------ window helpers
-    def _set_icon(self):
-        def go():
+    def _icon_image(self, glyph, px, color):
+        """Drawn replacement for an icon-font glyph. `color` may be a (light, dark) pair like any widget colour."""
+        key = (glyph, px, str(color))
+        img = self._icon_cache.get(key)
+        if img is None:
+            light, dark = (color, color) if isinstance(color, str) else color
+            fix = lambda c: "#ffffff" if c == "white" else c
+            name = ICON_NAMES[glyph]
+            img = ctk.CTkImage(light_image=icons.draw(name, px * 2, fix(light)),
+                               dark_image=icons.draw(name, px * 2, fix(dark)), size=(px, px))
+            self._icon_cache[key] = img
+        return img
+
+    def set_icon(self, btn, glyph, fallback, color=None):
+        """Show an icon on a button: the icon-font glyph where the font exists (Windows), a drawn image elsewhere."""
+        btn.icon_name = ICON_NAMES.get(glyph, fallback)
+        color = color if color is not None else btn.cget("text_color")
+        if self.icon_font or glyph not in ICON_NAMES:
+            self._put(btn, text=self.icon(glyph, fallback), text_color=color)
+            return
+        key = (glyph, str(color))
+        if getattr(btn, "_icon_key", None) != key:
+            btn._icon_key = key
+            btn.configure(image=self._icon_image(glyph, btn.icon_px, color), text="", text_color=color)
+
+    @staticmethod
+    def _put(widget, **kw):
+        """configure() only what actually differs. The speaker is polled every few seconds and nearly always reports
+        what is already on screen; skipping the no-op updates avoids redrawing the widgets each time."""
+        changed = {}
+        for k, v in kw.items():
             try:
-                self.iconbitmap(str(ICON))
-            except tk.TclError:
-                pass
-        go()
-        self.after(300, go)  # customtkinter resets the icon shortly after creation
+                if widget.cget(k) != v:
+                    changed[k] = v
+            except Exception:
+                changed[k] = v
+        if changed:
+            widget.configure(**changed)
+
+    # ------------------------------------------------------------ window helpers
+    def _apply_icon(self, win):
+        try:
+            if not win.winfo_exists():
+                return
+            if IS_WIN:
+                win.iconbitmap(str(ICON))
+                return
+            if self._icon_photo is None:
+                from PIL import ImageTk
+                img = _PILImage.open(ICON)
+                img.size = max(img.info.get("sizes", [img.size]))  # the largest picture in the .ico
+                self._icon_photo = ImageTk.PhotoImage(img.convert("RGBA").resize((128, 128), _PILImage.LANCZOS))
+            win.iconphoto(False, self._icon_photo)
+        except Exception as e:  # a missing icon must never stop the app
+            logging.info("window icon not set: %s", e)
+
+    def _set_icon(self):
+        self._apply_icon(self)
+        # customtkinter resets the icon shortly after creation
+        self._timers["icon"] = self.after(300, lambda: self._apply_icon(self))
+
+    def _on_map_change(self, event):
+        if event.widget is not self:
+            return
+        visible = event.type == tk.EventType.Map
+        was, self._visible = self._visible, visible
+        if visible and not was and self.speaker:
+            self._schedule_refresh()  # catch up at once; polling was slowed down while hidden
+
+    def _gc_tick(self):
+        self._gc_runs += 1
+        gc.collect(2 if self._gc_runs % 12 == 0 else 1)  # young objects every 5 s, everything once a minute
+        self._every("gc", 5000, self._gc_tick)
+
+    def _every(self, name, ms, fn):
+        """Schedule the next run of a repeating timer, remembering its id so quit_app() can cancel it."""
+        if self._closing:
+            return
+        try:
+            self._timers[name] = self.after(ms, fn)
+        except tk.TclError:
+            pass  # window is gone
 
     def _restore_position(self):
         pos = self.s.get("window_pos", "")
@@ -422,20 +802,26 @@ class App(ctk.CTk):
             self.iconify()
 
     def _hide_to_tray(self):
+        """Hide to the tray; if this desktop has no tray (or it fails), minimize instead so the window can't get lost."""
+        tray = self.tray
         try:
-            import pystray
-            from PIL import Image
-        except ImportError:
+            if not tray_available():
+                raise RuntimeError("this desktop has no system tray")
+            if tray is None:
+                import pystray
+                from PIL import Image
+                menu = pystray.Menu(
+                    pystray.MenuItem("Show", lambda: self.ui(self.show_window), default=True),
+                    pystray.MenuItem("Quit", lambda: self.ui(self.quit_app)),
+                )
+                tray = pystray.Icon("bose", Image.open(ICON), self.display_name(), menu)
+                tray.run_detached()
+        except Exception as e:
+            logging.info("tray unavailable, minimizing instead: %s", e)
             self.iconify()
             return
+        self.tray = tray
         self.withdraw()
-        if self.tray is None:
-            menu = pystray.Menu(
-                pystray.MenuItem("Show", lambda: self.ui(self.show_window), default=True),
-                pystray.MenuItem("Quit", lambda: self.ui(self.quit_app)),
-            )
-            self.tray = pystray.Icon("bose", Image.open(ICON), self.display_name(), menu)
-            self.tray.run_detached()
 
     def _on_close(self):
         action = self.s["close_action"]
@@ -447,35 +833,78 @@ class App(ctk.CTk):
             self.iconify()
 
     def quit_app(self):
+        if self._closing:
+            return
+        self._closing = True
         if self.s["remember_position"]:
             try:
                 self.set("window_pos", f"{self.winfo_x()},{self.winfo_y()}")
             except tk.TclError:
                 pass
         if self.tray:
-            self.tray.stop()
-        if self.speaker:
             try:
-                asyncio.run_coroutine_threadsafe(self.speaker.disconnect(), self.loop).result(timeout=3)
+                self.tray.stop()
             except Exception:
                 pass
+            self.tray = None
+        try:  # close the speaker connection and stop the background work, but never let that hold up quitting
+            asyncio.run_coroutine_threadsafe(self._shutdown(), self.loop).result(timeout=2)
+        except Exception:
+            pass
+        if self._instance_sock:
+            for close in (lambda: self._instance_sock.shutdown(socket.SHUT_RDWR),  # wakes the listener thread
+                          self._instance_sock.close):                              # frees the port straight away
+                try:
+                    close()
+                except OSError:
+                    pass
+        for job in (*self._timers.values(), self._art_job, self._seek_job, self._volume_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except (tk.TclError, ValueError):
+                    pass
         self.destroy()
+        gc.collect()  # free the window's Tk objects here, on the Tk thread (see __init__)
+        gc.enable()
+
+    async def _shutdown(self):
+        self._conn_gen += 1
+        speaker, self.speaker = self.speaker, None
+        if speaker:
+            try:
+                await asyncio.wait_for(speaker.disconnect(), 1.5)
+            except Exception:
+                pass
+        me = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            if task is not me:
+                task.cancel()
 
     def _instance_listener(self, srv):
-        while True:
+        srv.settimeout(1.0)  # wake up regularly so the thread ends when the app does
+        while not self._closing:
             try:
                 conn, _ = srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            try:
                 with conn:
+                    conn.settimeout(2.0)  # a client that connects and says nothing must not block later launches
                     if conn.recv(16) == b"show":
                         self.ui(self.show_window)
             except OSError:
-                return
+                continue
 
     # ------------------------------------------------------------ layout
     def _build_all(self):
         saved_errors = self.err_text.get("1.0", "end").strip() if hasattr(self, "err_text") else ""
         for child in self.winfo_children():
             child.destroy()
+        self._prog_shown = False
+        self._icon_cache.clear()
         self._build_header()
         self._build_login()
         self._build_remote()
@@ -508,7 +937,10 @@ class App(ctk.CTk):
         base = dict(width=size, height=size, corner_radius=size // 2, fg_color="transparent",
                     hover_color=HOVER, text_color=MUTED, font=self.I(int(size * 0.45)))
         base.update(kw)
-        return Btn(parent, text=self.icon(glyph, fallback), command=command, **base)
+        btn = Btn(parent, text="", command=command, **base)
+        btn.icon_px = int(size * 0.5)
+        self.set_icon(btn, glyph, fallback)
+        return btn
 
     def _build_header(self):
         head = ctk.CTkFrame(self, fg_color="transparent")
@@ -599,8 +1031,10 @@ class App(ctk.CTk):
         row.pack(pady=4)
         nav = dict(size=56, fg_color=BTN, hover_color=HOVER, text_color=TEXT)
         self._icon_btn(row, "", "⏮", lambda: self.cmd("skip_previous"), **nav).grid(row=0, column=0, padx=10)
-        self.play_btn = self._primary(row, self.icon("", "▶"), self._toggle_play, width=76, height=76,
+        self.play_btn = self._primary(row, "", self._toggle_play, width=76, height=76,
                                       corner_radius=38, font=self.I(28))
+        self.play_btn.icon_px = 30
+        self.set_icon(self.play_btn, "", "▶")
         self.play_btn.grid(row=0, column=1, padx=10)
         self._icon_btn(row, "", "⏭", lambda: self.cmd("skip_next"), **nav).grid(row=0, column=2, padx=10)
 
@@ -775,6 +1209,9 @@ class App(ctk.CTk):
                           ).pack(side="left", padx=2)
         self._switch_row(card, "Always on top", self.s["always_on_top"],
                          lambda v: (self.set("always_on_top", v), self.attributes("-topmost", v)))
+        if IS_LINUX:  # Windows scales the window with the display by itself
+            self._option_row(card, "Interface size", ["100%", "125%", "150%", "175%", "200%"],
+                             f"{int(self.s.get('ui_scale') or 100)}%", self._set_scale, width=110)
         self._end_card(card)
 
         card = self._section("Window")
@@ -789,15 +1226,16 @@ class App(ctk.CTk):
                          "Space play/pause · ↑↓ volume · ←→ previous/next · M mute")
         self._end_card(card)
 
-        card = self._section("Windows integration")
-        self._switch_row(card, "Desktop shortcut", shortcut_path("desktop").exists(),
+        card = self._section("Windows integration" if IS_WIN else "Desktop integration")
+        self._switch_row(card, "Desktop shortcut", shortcut_exists("desktop"),
                          lambda v: self._toggle_shortcut("desktop", v))
-        self._switch_row(card, "Start menu entry", shortcut_path("start").exists(),
+        self._switch_row(card, "Start menu entry" if IS_WIN else "Applications menu entry", shortcut_exists("start"),
                          lambda v: self._toggle_shortcut("start", v))
-        self._switch_row(card, "Run when I sign in to Windows", shortcut_path("startup").exists(),
-                         lambda v: self._toggle_shortcut("startup", v))
-        row = self._row(card, "Pin to taskbar", "Windows doesn't let apps pin themselves.")
-        self._btn(row, "How?", self._pin_help, width=70, height=32).grid(row=0, column=1, rowspan=2, sticky="e")
+        self._switch_row(card, "Run when I sign in to Windows" if IS_WIN else "Run when I sign in",
+                         shortcut_exists("startup"), lambda v: self._toggle_shortcut("startup", v))
+        if IS_WIN:
+            row = self._row(card, "Pin to taskbar", "Windows doesn't let apps pin themselves.")
+            self._btn(row, "How?", self._pin_help, width=70, height=32).grid(row=0, column=1, rowspan=2, sticky="e")
         self._end_card(card)
 
         card = self._section("Sound")
@@ -854,7 +1292,7 @@ class App(ctk.CTk):
         grid = ctk.CTkFrame(card, fg_color="transparent")
         grid.pack(fill="x", padx=18, pady=(10, 0))
         grid.columnconfigure((0, 1), weight=1, uniform="c")
-        self._btn(grid, "Open data folder", lambda: os.startfile(DATA_DIR)).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self._btn(grid, "Open data folder", self._open_data_folder).grid(row=0, column=0, padx=(0, 4), sticky="ew")
         self._btn(grid, "Reset settings", self._reset_settings).grid(row=0, column=1, padx=(4, 0), sticky="ew")
         self._end_card(card)
 
@@ -883,7 +1321,7 @@ class App(ctk.CTk):
         self._btn(top, "Clear", self._clear_errors, width=54, height=24, corner_radius=8, font=self.F(11)).pack(side="right")
         self._btn(top, "Copy", self._copy_errors, width=54, height=24, corner_radius=8, font=self.F(11)).pack(side="right", padx=6)
         self.err_text = ctk.CTkTextbox(self.err_frame, height=110, fg_color=BG, text_color=RED, corner_radius=10,
-                                       font=ctk.CTkFont(family="Consolas", size=11), wrap="word")
+                                       font=ctk.CTkFont(family=self.mono_font, size=11), wrap="word")
         self.err_text.pack(fill="both", expand=True, padx=14, pady=10)
         self.err_text.configure(state="disabled")
         if self.s["show_log"]:
@@ -919,7 +1357,20 @@ class App(ctk.CTk):
 
     def _set_appearance(self, v):
         self.set("appearance", v)
-        ctk.set_appearance_mode(v)
+        if v == "System" and not IS_WIN:
+            self._sys_theme = system_theme()
+        ctk.set_appearance_mode(self._appearance())
+
+    def _set_scale(self, v):
+        pct = int(str(v).rstrip("%"))
+        self.set("ui_scale", pct)
+        set_ui_scale(pct)
+
+    def _open_data_folder(self):
+        try:
+            open_path(DATA_DIR)
+        except Exception as e:
+            self.log_error(f"Could not open {DATA_DIR}", e)
 
     def _set_accent(self, v):
         self.set("accent", v)
@@ -951,7 +1402,7 @@ class App(ctk.CTk):
         win.title("Pin to taskbar")
         win.geometry("380x230")
         win.transient(self)
-        win.after(300, lambda: win.iconbitmap(str(ICON)))
+        win.after(300, lambda: self._apply_icon(win))
         ctk.CTkLabel(win, justify="left", wraplength=330, font=self.F(13), text=(
             "1.  Keep the app open.\n"
             "2.  Right-click its icon in the taskbar.\n"
@@ -990,7 +1441,9 @@ class App(ctk.CTk):
         self.s = dict(DEFAULTS)
         self.cfg["settings"] = self.s
         save_config(self.cfg)
-        ctk.set_appearance_mode(self.s["appearance"])
+        ctk.set_appearance_mode(self._appearance())
+        if IS_LINUX:
+            set_ui_scale(100)
         self.accent = ACCENTS[self.s["accent"]]
         self.accent_hover = darken(self.accent)
         self.attributes("-topmost", False)
@@ -1040,18 +1493,17 @@ class App(ctk.CTk):
                     logging.exception("UI callback failed")
         except queue.Empty:
             pass
-        try:
-            self.after(25, self._drain_ui)
-        except tk.TclError:
-            pass  # window is gone
+        # 30 ms keeps the window responsive; while it is minimized or in the tray nobody is watching, so the
+        # process is allowed to sleep far longer between checks
+        self._every("drain", 30 if self._visible else 200, self._drain_ui)
 
     def set_status(self, text, color=MUTED, dot=None):
         self._status = (text, color, dot or self._status[2])
 
         def go():
-            self.status.configure(text=text, text_color=color)
+            self._put(self.status, text=text, text_color=color)
             if dot:
-                self.dot.configure(text_color=dot)
+                self._put(self.dot, text_color=dot)
         self.ui(go)
 
     def log_error(self, context, exc=None):
@@ -1064,6 +1516,9 @@ class App(ctk.CTk):
     def _append_error(self, msg):
         self.err_text.configure(state="normal")
         self.err_text.insert("end", msg + "\n")
+        lines = int(self.err_text.index("end-1c").split(".")[0])
+        if lines > MAX_ERROR_LINES:  # an error that repeats for days must not grow this without limit
+            self.err_text.delete("1.0", f"{lines - MAX_ERROR_LINES + 1}.0")
         self.err_text.see("end")
         self.err_text.configure(state="disabled")
 
@@ -1085,21 +1540,66 @@ class App(ctk.CTk):
             try:
                 await coro
             except Exception as e:
-                self.log_error(context, e)
-        asyncio.run_coroutine_threadsafe(wrapped(), self.loop)
+                if not self._closing:
+                    self.log_error(context, e)
+        try:
+            asyncio.run_coroutine_threadsafe(wrapped(), self.loop)
+        except RuntimeError:  # the loop has been shut down
+            coro.close()
 
     def cmd(self, name, *args):
-        if not self.speaker:
+        speaker = self.speaker
+        if not speaker:
             self.log_error("Not connected to a soundbar yet")
             return
 
         async def go():
-            await getattr(self.speaker, name)(*args)
+            await self._call(speaker, name, *args)
             await self._refresh()
         self.run(go(), f"Command '{name}' failed")
 
+    async def _call(self, speaker, name, *args):
+        """Run one speaker command. If it fails because the connection dropped or the login expired, repair that
+        and try once more, so a button press after the PC woke from sleep just works."""
+        try:
+            return await getattr(speaker, name)(*args)
+        except Exception as e:
+            if not await self._recover(speaker, e):
+                raise
+        return await getattr(speaker, name)(*args)
+
+    @staticmethod
+    def _is_auth_error(exc):
+        return getattr(exc, "http_status", None) in (401, 403)
+
+    async def _recover(self, speaker, exc, force=False):
+        """Try to repair whatever made a request fail. True if something was repaired and a retry makes sense.
+
+        - the speaker rejected our login (401/403): renew the token;
+        - the request never got an answer in the usual sense (no HTTP-like status: the socket is gone): reconnect;
+        - the speaker answered with an error or stayed silent (408): nothing to repair for a command, since it may
+          have been carried out. The background poll passes force=True to reconnect anyway.
+        """
+        if self.speaker is not speaker or self._closing:
+            return False
+        if self._is_auth_error(exc):
+            await self._renew_token(force=True)
+            return self.speaker is speaker
+        if getattr(exc, "http_status", None) is not None and not force:
+            return False
+        return await self._revive(speaker)
+
+    async def _revive(self, speaker):
+        """Re-open the connection of the current speaker. True if it is (still) the current speaker afterwards."""
+        async with self._conn_lock:
+            if self.speaker is not speaker or self._closing:
+                return False
+            await asyncio.wait_for(speaker.connect(), CONNECT_TIMEOUT)  # pybose re-subscribes by itself
+        return True
+
     def _pick_source(self, source, account):
-        if not self.speaker:
+        speaker = self.speaker
+        if not speaker:
             self.log_error("Not connected to a soundbar yet")
             return
         label = next((lbl for lbl, s, a in self.sources if s == source and a == account), source)
@@ -1111,31 +1611,46 @@ class App(ctk.CTk):
             if account:
                 body["sourceAccount"] = account
             self.set_status(f"Switching to {label}...")
-            await self.speaker._request("/content/playbackRequest", "POST", body)
+            await self._call(speaker, "_request", "/content/playbackRequest", "POST", body)
             await asyncio.sleep(0.6)
             await self._refresh()
             self.set_status(f"Connected  ·  {self.cfg.get('host', '')}", GREEN, GREEN)
         self.run(go(), f"Could not switch to {label}")
 
     # -------------------------------------------------------- connection
+    @staticmethod
+    def _is_offline_error(exc):
+        """The Bose login service could not be reached (as opposed to: it refused us)."""
+        return isinstance(exc, (OSError, BoseAuthUnavailableError)) and not isinstance(exc, BoseAuthRejectedError)
+
     async def _startup(self):
         shutil.rmtree(DATA_DIR / "update", ignore_errors=True)  # leftovers from a previous self-update
         if self.s["check_updates"] and REPO:
             self.run(self._check_updates(), "Update check failed")
         tok = self.cfg.get("token")
-        if tok:
-            self.set_status("Restoring saved login...")
+        if not tok:
+            self.set_status("Please log in")
+            self.ui(self._set_main, "login")
+            return
+        self.set_status("Restoring saved login...")
+        delay = LOGIN_RETRY_SECONDS
+        while not self._closing:
             try:
                 await self._restore_token(tok)
+                break
             except Exception as e:
+                if self._is_offline_error(e):
+                    # typical at sign-in: the app starts before the network is up. Keep the login and wait.
+                    logging.info("can't reach Bose to renew the login yet: %s", e)
+                    self.set_status("Waiting for an internet connection to renew the login...", MUTED, RED)
+                    await asyncio.sleep(delay)
+                    delay = min(MAX_RETRY_SECONDS, delay * 2)
+                    continue
                 self.log_error("Saved login no longer works, please log in again", e)
                 self.cfg.pop("token", None)
                 self.ui(self._set_main, "login")
                 return
-            await self._connect()
-        else:
-            self.set_status("Please log in")
-            self.ui(self._set_main, "login")
+        await self._connect()
 
     async def _restore_token(self, tok):
         self.auth = BoseAuth()
@@ -1152,6 +1667,38 @@ class App(ctk.CTk):
             self.cfg["token"] = dict(t)
             self.cfg["azure_refresh_token"] = self.auth.get_azure_refresh_token()
             save_config(self.cfg)
+
+    async def _renew_token(self, force=False):
+        """The Bose login expires after a while and pybose does not renew it by itself. An app that sits in the tray
+        for days would otherwise end up with every request rejected, forever. Called before each poll (cheap: it
+        only reads the expiry time) and when the speaker rejects the token."""
+        auth = self.auth
+        if not force:
+            remaining = getattr(auth, "get_token_validity_time", None)
+            if (remaining() > 120) if remaining else auth.is_token_valid():
+                return
+        try:
+            await asyncio.to_thread(auth.do_token_refresh)
+        except Exception as e:
+            if not self._is_offline_error(e) and auth is self.auth:
+                self._login_expired(e)
+            raise
+        if auth is self.auth:
+            self._save_tokens()
+            logging.info("login renewed")
+
+    def _login_expired(self, exc):
+        """Bose refused to renew the login: only signing in again helps."""
+        logging.warning("the saved login can't be renewed: %s", exc)
+        self.cfg.pop("token", None)
+        self.cfg.pop("azure_refresh_token", None)
+        save_config(self.cfg)
+        self._conn_gen += 1
+        speaker, self.speaker = self.speaker, None
+        if speaker:
+            asyncio.run_coroutine_threadsafe(self._close_speaker(speaker), self.loop)
+        self.set_status("Your Bose login expired, please log in again", RED, RED)
+        self.ui(self._set_main, "login")
 
     def _toggle_pw(self):
         self.password.configure(show="" if self.show_pw.get() else "•")
@@ -1204,57 +1751,93 @@ class App(ctk.CTk):
         self.ui(self._show, "login")
 
     def _reconnect(self):
-        async def go():
-            await self._disconnect()
-            await self._connect()
-        self.run(go(), "Reconnect failed")
+        self.run(self._connect(), "Reconnect failed")
+
+    @staticmethod
+    async def _close_speaker(speaker):
+        try:
+            await asyncio.wait_for(speaker.disconnect(), 5)
+        except Exception as e:
+            logging.warning("disconnect: %s", e)
 
     async def _disconnect(self):
-        if self.speaker:
-            try:
-                await self.speaker.disconnect()
-            except Exception as e:
-                logging.warning("disconnect: %s", e)
-            self.speaker = None
+        self._conn_gen += 1  # also stops any background reconnect attempts
+        speaker, self.speaker = self.speaker, None
+        async with self._conn_lock:
+            if speaker:
+                await self._close_speaker(speaker)
 
-    async def _connect(self):
-        self.ui(self._set_main, "remote")
-        host, guid = self.cfg.get("host"), self.cfg.get("guid")
-        try:
-            if not host:
-                self.set_status("Searching for soundbar on your network...")
-                devices = await asyncio.to_thread(BoseDiscovery().discover_devices, 5)
-                if devices:
-                    host, guid = devices[0]["IP"], devices[0]["GUID"]
-                else:
-                    self.set_status("mDNS found nothing, scanning your network...")
-                    found = await asyncio.to_thread(scan_subnet)
-                    if not found:
-                        self.log_error("No Bose device found by mDNS or by scanning port 8082 on this subnet.")
-                        return
-                    host, guid = found[0], None  # pybose learns the device id from the first message
-                self.cfg.update(host=host, guid=guid)
+    async def _connect(self, quiet=False):
+        """Find the speaker (unless its address is saved) and connect. `quiet` is used by the background retries:
+        they don't touch the status line or the error panel, they just keep trying."""
+        self._conn_gen += 1
+        gen = self._conn_gen  # a newer connect/disconnect makes this attempt (and its retries) obsolete
+        old, self.speaker = self.speaker, None
+        async with self._conn_lock:  # never two attempts at once: that used to leave orphaned connections behind
+            if old:
+                await self._close_speaker(old)
+            if gen != self._conn_gen or self._closing:
+                return
+            self.ui(self._set_main, "remote")
+            host, guid = self.cfg.get("host"), self.cfg.get("guid")
+            speaker = None
+            try:
+                if not host:
+                    if not quiet:
+                        self.set_status("Searching for soundbar on your network...")
+                    devices = await asyncio.to_thread(BoseDiscovery().discover_devices, 5)
+                    if devices:
+                        host, guid = devices[0]["IP"], devices[0]["GUID"]
+                    else:
+                        found = []
+                        # the port scan opens a connection to every address on the subnet: fine when the user is
+                        # waiting for it, not something to repeat every minute in the background
+                        if not quiet or time.monotonic() - self._last_scan >= SUBNET_SCAN_EVERY:
+                            self._last_scan = time.monotonic()
+                            if not quiet:
+                                self.set_status("mDNS found nothing, scanning your network...")
+                            found = await asyncio.to_thread(scan_subnet)
+                        if not found:
+                            if not quiet:
+                                self.log_error("No Bose device found by mDNS or by scanning port 8082 on this subnet.")
+                            self._retry_connect_later(gen)
+                            return
+                        host, guid = found[0], None  # pybose learns the device id from the first message
+                    self.cfg.update(host=host, guid=guid)
+                    save_config(self.cfg)
+                if not quiet:
+                    self.set_status(f"Connecting to {host}...")
+                # auto_reconnect off: pybose's own reconnect can run twice at once and leaves failed attempts
+                # unobserved; _poll() below supervises the connection instead
+                speaker = BoseSpeaker(host=host, device_id=guid, bose_auth=self.auth, auto_reconnect=False)
+                speaker.attach_receiver(lambda _m: self._schedule_refresh())
+                await asyncio.wait_for(speaker.connect(), CONNECT_TIMEOUT)
+            except Exception as e:
+                if speaker:
+                    await self._close_speaker(speaker)
+                # a stale saved IP is a common cause; forget it so the next try rediscovers
+                self.cfg.pop("host", None)
+                self.cfg.pop("guid", None)
                 save_config(self.cfg)
-            self.set_status(f"Connecting to {host}...")
-            self.speaker = BoseSpeaker(host=host, device_id=guid, bose_auth=self.auth)
-            self.speaker.attach_receiver(lambda _m: self._schedule_refresh())
-            await self.speaker.connect()
-        except Exception as e:
-            self.speaker = None
-            # a stale saved IP is a common cause; forget it so the next try rediscovers
-            self.cfg.pop("host", None)
-            self.cfg.pop("guid", None)
-            save_config(self.cfg)
-            self.log_error(f"Could not connect to the soundbar at {host}", e)
-            return
+                if quiet:
+                    logging.info("still can't connect to the soundbar at %s: %s", host, e)
+                else:
+                    self.log_error(f"Could not connect to the soundbar at {host}", e)
+                self._retry_connect_later(gen)
+                return
+            if gen != self._conn_gen or self._closing:
+                await self._close_speaker(speaker)
+                return
+            self.speaker = speaker
+            self._retry_n = 0
         self.set_status(f"Connected  ·  {host}", GREEN, GREEN)
         try:
-            await self.speaker.subscribe()  # ask the speaker to push now-playing / volume / source changes
+            await speaker.subscribe()  # ask the speaker to push now-playing / volume / source changes
         except Exception as e:
             logging.info("subscribe failed: %s", e)
-        asyncio.create_task(self._poll(self.speaker))
+        asyncio.create_task(self._poll(speaker))
         try:
-            info = await self.speaker.get_system_info()
+            info = await speaker.get_system_info()
             self.speaker_name = info.get("name") or info.get("productName")
             logging.info("system info: %s", {k: info.get(k) for k in ("name", "productName", "productType")})
             self.ui(self._refresh_names)
@@ -1262,16 +1845,59 @@ class App(ctk.CTk):
             logging.info("system info unavailable: %s", e)
         await self._refresh(sources=True)
 
+    def _retry_connect_later(self, gen):
+        """The speaker wasn't there (switched off, or the PC started before its network was up): keep trying in the
+        background, less and less often, instead of staying broken until the user presses Reconnect."""
+        self._retry_n += 1
+        n = self._retry_n
+        delay = min(MAX_RETRY_SECONDS, FIRST_RETRY_SECONDS * 2 ** min(n - 1, 3)) if n < 10 else MAX_RETRY_SECONDS * 5
+
+        async def go():
+            await asyncio.sleep(delay)
+            if gen == self._conn_gen and self.speaker is None and self.cfg.get("token") and not self._closing:
+                await self._connect(quiet=True)
+        self.run(go(), "Reconnect failed")
+
+    def _poll_delay(self, failures=0):
+        delay = POLL_SECONDS * (1 if self._visible else HIDDEN_POLL_FACTOR)
+        if failures:  # back off while the speaker is unreachable: 10 s, 20 s, 40 s, then once a minute
+            delay = max(delay, min(MAX_RETRY_SECONDS, POLL_SECONDS * 2 ** min(failures, 6)))
+        return delay
+
     async def _poll(self, speaker):
-        """Safety net: also re-read the state every few seconds in case a push notification is missed."""
-        while self.speaker is speaker:
-            await asyncio.sleep(POLL_SECONDS)
-            if self.speaker is not speaker:
+        """Safety net and supervisor for one connection: re-read the state every few seconds in case a push
+        notification was missed, keep the login fresh, and bring the connection back when it drops (PC woke from
+        sleep, Wi-Fi blip, speaker restarted)."""
+        failures = 0
+        while self.speaker is speaker and not self._closing:
+            await asyncio.sleep(self._poll_delay(failures))
+            if self.speaker is not speaker or self._closing:
                 return
             try:
-                await self._refresh()
+                await self._renew_token()
+                if failures:  # known to be down: reconnect first instead of talking into a dead connection
+                    if not await self._revive(speaker):
+                        return
+                    await self._refresh(sources=True)
+                else:
+                    try:
+                        await self._refresh()
+                    except Exception as e:
+                        if not await self._recover(speaker, e, force=True):
+                            raise
+                        await self._refresh(sources=True)
             except Exception as e:
-                logging.info("poll refresh failed: %s", e)
+                if self.speaker is not speaker or self._closing:
+                    return
+                failures += 1
+                logging.info("speaker not reachable: %s", e)  # repeats are collapsed by the log filter
+                if failures == 1:
+                    self.set_status("The speaker isn't answering, retrying...", MUTED, RED)
+            else:
+                if failures:
+                    failures = 0
+                    logging.info("speaker is reachable again")
+                    self.set_status(f"Connected  ·  {self.cfg.get('host', '')}", GREEN, GREEN)
 
     # ------------------------------------------------------------ updates
     def _set_update_text(self, text):
@@ -1301,7 +1927,7 @@ class App(ctk.CTk):
     def _show_update_bar(self):
         info = self.update_info
         self.update_lbl_bar.configure(text=f"Update available · v{info['version']}")
-        can_install = bool(info.get("installer_url")) and getattr(sys, "frozen", False)
+        can_install = bool(info.get("installer_url")) and getattr(sys, "frozen", False) and CAN_SELF_UPDATE
         self.update_btn.configure(text="Install now" if can_install else "View release")
         self.update_bar.pack(fill="x", padx=24, pady=(10, 0), after=self.head)
 
@@ -1309,7 +1935,7 @@ class App(ctk.CTk):
         info = self.update_info
         if not info:
             return
-        if not (info.get("installer_url") and getattr(sys, "frozen", False)):
+        if not (info.get("installer_url") and getattr(sys, "frozen", False) and CAN_SELF_UPDATE):
             webbrowser.open(info.get("page") or f"https://github.com/{REPO}/releases/latest")
             return
 
@@ -1360,30 +1986,35 @@ class App(ctk.CTk):
         await self._refresh()
 
     async def _refresh(self, sources=False):
-        if not self.speaker:
+        speaker = self.speaker
+        if not speaker:
             return
         self._refresh_seq += 1
         seq = self._refresh_seq
-        vol = await self.speaker.get_audio_volume()
+        vol = await speaker.get_audio_volume()
         try:
-            np = await self.speaker.get_now_playing()
+            np = await speaker.get_now_playing()
         except Exception as e:
             logging.info("now playing unavailable: %s", e)
             np = {}
         try:
-            power = (await self.speaker.get_power_state()).get("power", "ON")
+            power = (await speaker.get_power_state()).get("power", "ON")
         except Exception as e:
             logging.info("power state unavailable: %s", e)
             power = "ON"
+        if self.speaker is not speaker:
+            return  # disconnected or replaced while we were asking
         src_now = (np.get("source") or {}).get("sourceID") if np else None
         if src_now != self._last_src_seen:
             self._last_src_seen = src_now
             sources = True  # e.g. Spotify Connect just started: its account list may have changed
         if sources:
             try:
-                self.all_sources = self.build_sources(await self.speaker.get_sources())
-                self._apply_source_filter()
-                self.ui(self._render_source_settings)
+                found = self.build_sources(await speaker.get_sources())
+                if found != self.all_sources or not self.all_sources:
+                    self.all_sources = found
+                    self._apply_source_filter()
+                    self.ui(self._render_source_settings)
             except Exception as e:
                 logging.info("sources unavailable: %s", e)
         self.ui(self._apply_if_newest, seq, vol, np, power)
@@ -1402,12 +2033,14 @@ class App(ctk.CTk):
         self.cur_vol = vol["value"]
         self.muted = vol.get("muted", False)
         self.power_on = str(power).upper() not in ("OFF", "STANDBY")
-        self.power_btn.configure(text_color=self.accent if self.power_on else MUTED)
+        self.set_icon(self.power_btn, "", "⏻", self.accent if self.power_on else MUTED)
         if self._volume_job is None:
-            self.slider.set(min(vol["value"], int(self.s["max_volume"])))
-        self.vol_label.configure(text=str(vol["value"]))
-        self.mute_btn.configure(text=self.icon("" if self.muted else "", "🔇" if self.muted else "🔊"),
-                                text_color=RED if self.muted else TEXT)
+            shown = min(vol["value"], int(self.s["max_volume"]))
+            if self.slider.get() != shown:
+                self.slider.set(shown)
+        self._put(self.vol_label, text=str(vol["value"]))
+        self.set_icon(self.mute_btn, "" if self.muted else "", "🔇" if self.muted else "🔊",
+                      RED if self.muted else TEXT)
 
         md = np.get("metadata") or {}
         track = np.get("track") or {}
@@ -1417,9 +2050,9 @@ class App(ctk.CTk):
         friendly = next((lbl for lbl, s, a in self.sources if s == self.cur_source), "")
         title = md.get("trackName") or track.get("contentItem", {}).get("name") or friendly or src or "Nothing playing"
         sub = " · ".join(x for x in (md.get("artist"), md.get("album")) if x)
-        self.title_lbl.configure(text=title)
-        self.sub_lbl.configure(text=sub)
-        self.src_badge.configure(text=f"PLAYING FROM {friendly.upper()}" if friendly and title != friendly else "")
+        self._put(self.title_lbl, text=title)
+        self._put(self.sub_lbl, text=sub)
+        self._put(self.src_badge, text=f"PLAYING FROM {friendly.upper()}" if friendly and title != friendly else "")
         art_url = ((track.get("contentItem") or {}).get("containerArt")
                    or ((np.get("container") or {}).get("contentItem") or {}).get("containerArt"))
         if art_url != self._art_url:
@@ -1434,7 +2067,7 @@ class App(ctk.CTk):
                 self._set_art(self.art_default_pil, text="♪")
         self._sync_progress(md, np.get("state") or {}, (np.get("state") or {}).get("status") == "PLAY")
         self.playing = (np.get("state") or {}).get("status") == "PLAY"
-        self.play_btn.configure(text=self.icon("" if self.playing else "", "⏸" if self.playing else "▶"))
+        self.set_icon(self.play_btn, "" if self.playing else "", "⏸" if self.playing else "▶")
         self._render_sources()
 
     # ------------------------------------------------- cover fade + progress
@@ -1475,26 +2108,33 @@ class App(ctk.CTk):
         widgets = (self.pos_lbl, self.pos_slider, self.dur_lbl)
         if dur and pos is not None:
             self._dur, self._pos_base, self._pos_t0 = float(dur), float(pos), time.monotonic()
-            self.pos_slider.configure(to=max(self._dur, 1))
-            for w in widgets:
-                w.grid()
+            self._put(self.pos_slider, to=max(self._dur, 1))
+            if not self._prog_shown:
+                self._prog_shown = True
+                for w in widgets:
+                    w.grid()
             self._tick(reschedule=False)
         else:
             self._dur = 0
-            for w in widgets:
-                w.grid_remove()
+            if self._prog_shown:
+                self._prog_shown = False
+                for w in widgets:
+                    w.grid_remove()
 
     def _tick(self, reschedule=True):
         """Advance the progress bar locally between speaker updates (the speaker only reports a snapshot)."""
         try:
-            if self._dur and not self._seeking:
+            # the timer does nothing while the window is minimized / in the tray; explicit calls always update
+            if self._dur and not self._seeking and (self._visible or not reschedule):
                 pos = self._pos_base + ((time.monotonic() - self._pos_t0) if self._playing_now else 0)
                 pos = max(0.0, min(self._dur, pos))
-                self.pos_slider.set(pos)
-                self.pos_lbl.configure(text=self.fmt_time(pos))
-                self.dur_lbl.configure(text=self.fmt_time(self._dur))
+                if abs(self.pos_slider.get() - pos) > 0.05:
+                    self.pos_slider.set(pos)
+                self._put(self.pos_lbl, text=self.fmt_time(pos))
+                self._put(self.dur_lbl, text=self.fmt_time(self._dur))
             if reschedule:
-                self.after(500, self._tick)
+                moving = self._visible and self._dur and self._playing_now
+                self._every("tick", 500 if moving else 1000, self._tick)
         except tk.TclError:
             pass  # window is being destroyed
 
@@ -1533,14 +2173,27 @@ class App(ctk.CTk):
 
 
 def main():
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(AUMID)
-    except Exception:
-        pass
+    if IS_WIN:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(AUMID)
+        except Exception:
+            pass
     sock = acquire_single_instance()
     if sock is None:  # already running; it has been told to show itself
         return
-    App(sock, start_hidden="--minimized" in sys.argv).mainloop()
+    try:
+        app = App(sock, start_hidden="--minimized" in sys.argv)
+    except tk.TclError as e:  # e.g. Linux without a graphical session
+        logging.error("could not open a window: %s", e)
+        sys.stderr.write(f"{APP_NAME}: could not open a window ({e})\n")
+        sys.exit(1)
+    try:
+        app.mainloop()
+    finally:
+        # Leave now. Normal interpreter shutdown waits for helper threads (tray icon, network), and a process that
+        # lingers invisibly keeps the single-instance port, so the next launch would do nothing at all.
+        logging.shutdown()
+        os._exit(0)
 
 
 if __name__ == "__main__":
