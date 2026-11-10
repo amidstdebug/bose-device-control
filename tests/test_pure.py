@@ -99,6 +99,7 @@ def test_source_key_is_stable_and_distinguishes_accounts():
 
 
 # ---------------------------------------------------------------- shortcuts
+@windows_only
 def test_launch_spec_from_source(monkeypatch):
     monkeypatch.delattr(sys, "frozen", raising=False)
     target, args, workdir, icon = b.launch_spec()
@@ -107,6 +108,7 @@ def test_launch_spec_from_source(monkeypatch):
     assert icon.endswith("icon.ico")
 
 
+@windows_only
 def test_launch_spec_when_packaged(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", r"C:\Apps\BoseSoundbarRemote.exe")
@@ -213,6 +215,9 @@ class _Resp:
 
     def raise_for_status(self):
         pass
+
+    def close(self):
+        self.closed = True
 
 
 def test_fetch_image_refuses_plain_http(monkeypatch):

@@ -6,7 +6,7 @@ timeout_method = "thread"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
-source = ["bose_app", "updater"]
+source = ["bose_app", "updater", "icons"]
 
 [tool.coverage.report]
 show_missing = true
